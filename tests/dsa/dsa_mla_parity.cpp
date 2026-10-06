@@ -44,9 +44,13 @@ namespace {
 //   - a quantized product also quantizes its activation: the GPU to Q8_1 (code = roundf(x / d), Strata's native
 //     quantizer, the same rule as llama.cpp's CUDA backend), ggml-cpu on x86 to Q8_0 (code = rint(x * (127 / amax))).
 //     The codes agree except near a rounding tie; each disagreement moves one code by 1, i.e. the column's output by
-//     at most d * max|w|. `flip_step_sum` finds those codes on the host from the very values the GPU quantizes, so
-//     the tolerance is 1e-5 + 1.5 * (sum of d over the column's flipped codes) * max|w| / max|ref|: exactly 1e-5 when
-//     no code flips, and a bound derived from the data when one does.
+//     at most d * max|w|. Which way a near-tie goes is the GPU's own arithmetic (CUDA's quantizer divides with
+//     div.approx under --use_fast_math, HIP in IEEE), so `q8_1_flip_bound` reads the GPU's Q8_1 blocks back after
+//     the product and compares them with ggml-cpu's codes of the same values: the tolerance is
+//     1e-5 + 1.5 * (sum of |d * code difference| over the column's flipped codes) * max|w| / max|ref|, exactly 1e-5
+//     when no code flips, and a bound derived from the data when one does. The read-back codes are themselves held
+//     to the rule: each must be roundf(x / d) of the host, or one step off it at a near-tie (counted, "off rule");
+//     anything else fails the case, so a broken quantizer cannot widen its own tolerance.
 // THE CHAINED STEP (part 2, dsa_decode on the oracle's selection) is a wiring check: every stage is held to its own
 // tolerance above, and a chain without a flipped code agrees to ~1e-6 (counted as "flip-free"); a flip early in
 // the chain (in x, before wq_a) is carried through five quantized products and the softmax, and with these random
@@ -57,7 +61,7 @@ constexpr double kF32Tol = 1e-5, kNormTol = 1e-6, kChainTol = 5e-2, kFlipFree = 
 struct StageErr {
     const char* name;
     double rel = 0.0, tol = 0.0;
-    int64_t flips = 0;
+    int64_t flips = 0, off_rule = 0, bad = 0;
 };
 constexpr int kStages = 9;
 constexpr const char* kStageNames[kStages] = {"wq_a", "wkv_a", "q_norm", "kv_norm", "wq_b", "k_b", "attend", "v_b", "wo"};
@@ -66,7 +70,7 @@ constexpr const char* kChainNames[kChain] = {"qr", "q", "q_abs", "latent", "o_la
 
 struct Agg {
     double worst[kStages] = {}, worst_ratio[kStages] = {}, worst_noflip[kStages] = {};
-    int64_t flips[kStages] = {};
+    int64_t flips[kStages] = {}, off_rule[kStages] = {}, bad[kStages] = {};
     double worst_chain[kChain] = {};
     double worst_e2e_out = 0.0, worst_e2e_mla = 0.0, min_overlap = 1.0;
     int64_t code_mismatch = 0, code_total = 0;
@@ -80,9 +84,10 @@ struct Bufs {
     void* xq = nullptr;
 };
 
-// one quantized product's stage check: x [cols][n_in] (host, the oracle's values) through `run` on the device
+// one quantized product's stage check: x [cols][n_in] (host, the oracle's values) through `run` on the device,
+// which quantizes it into d_xq (read back for the flip bound) and multiplies into d_y
 StageErr stage_q(const char* name, const std::vector<float>& x, int64_t cols, int64_t n_in, double max_w,
-                 const std::vector<float>& ref, float* d_x, float* d_y, cudaStream_t st,
+                 const std::vector<float>& ref, float* d_x, const void* d_xq, float* d_y, cudaStream_t st,
                  const std::function<void()>& run) {
     StageErr e{name};
     ck(cudaMemcpy(d_x, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "stage in");
@@ -90,9 +95,13 @@ StageErr stage_q(const char* name, const std::vector<float>& x, int64_t cols, in
     ck(cudaStreamSynchronize(st), "stage");
     const std::vector<float> got = download(d_y, ref.size());
     const Err r = compare(got.data(), ref.data(), (int64_t) ref.size());
-    const double steps = flip_step_sum(x.data(), cols, n_in, &e.flips);
+    const std::vector<uint8_t> xq = download(static_cast<const uint8_t*>(d_xq), (size_t) (cols * (n_in / 32) * 36));
+    const FlipBound fb = q8_1_flip_bound(x.data(), xq.data(), cols, n_in);
+    e.flips = fb.flips;
+    e.off_rule = fb.off_rule;
+    e.bad = fb.bad;
     e.rel = r.rel;
-    e.tol = kF32Tol + 1.5 * steps * max_w / (r.ref_max > 0 ? r.ref_max : 1.0);
+    e.tol = kF32Tol + 1.5 * fb.steps * max_w / (r.ref_max > 0 ? r.ref_max : 1.0);
     return e;
 }
 StageErr stage_f(const char* name, const std::vector<float>& got, const std::vector<float>& ref, double tol) {
@@ -130,11 +139,11 @@ void run_case(const DsaShapes& s, const HostWeights& hw, const DeviceWeights& dw
 
     // ---- part 1: every stage on the oracle's inputs
     StageErr se[kStages];
-    se[0] = stage_q("wq_a", in.x, T, E, q8_0_max_abs(hw.wq_a), A.qa, bf.a, bf.b, st, [&] {
+    se[0] = stage_q("wq_a", in.x, T, E, q8_0_max_abs(hw.wq_a), A.qa, bf.a, bf.xq, bf.b, st, [&] {
         sk::native_quantize_q8_1(bf.a, bf.xq, E, n, st);
         sk::native_mmvq(8, w.wq_a, bf.xq, bf.b, E, (int) s.q_lora, n, st);
     });
-    se[1] = stage_q("wkv_a", in.x, T, E, q8_0_max_abs(hw.wkv_a), A.kv, bf.a, bf.b, st, [&] {
+    se[1] = stage_q("wkv_a", in.x, T, E, q8_0_max_abs(hw.wkv_a), A.kv, bf.a, bf.xq, bf.b, st, [&] {
         sk::native_quantize_q8_1(bf.a, bf.xq, E, n, st);
         sk::native_mmvq(8, w.wkv_a, bf.xq, bf.b, E, (int) s.kv_lora, n, st);
     });
@@ -146,11 +155,11 @@ void run_case(const DsaShapes& s, const HostWeights& hw, const DeviceWeights& dw
         sk::dsa_rms_norm(bf.a, w.kv_a_norm, s.rms_eps, s.kv_lora, T, bf.b, st);
         se[3] = stage_f("kv_norm", download(bf.b, A.latent.size()), A.latent, kNormTol);
     }
-    se[4] = stage_q("wq_b", A.qr, T, s.q_lora, q8_0_max_abs(hw.wq_b), A.q, bf.a, bf.b, st, [&] {
+    se[4] = stage_q("wq_b", A.qr, T, s.q_lora, q8_0_max_abs(hw.wq_b), A.q, bf.a, bf.xq, bf.b, st, [&] {
         sk::native_quantize_q8_1(bf.a, bf.xq, (int) s.q_lora, n, st);
         sk::native_mmvq(8, w.wq_b, bf.xq, bf.b, (int) s.q_lora, (int) (s.n_head * s.head_k), n, st);
     });
-    se[5] = stage_q("k_b", A.q, T * s.n_head, s.head_k, q8_0_max_abs(hw.wk_b), A.q_abs, bf.a, bf.b, st, [&] {
+    se[5] = stage_q("k_b", A.q, T * s.n_head, s.head_k, q8_0_max_abs(hw.wk_b), A.q_abs, bf.a, bf.xq, bf.b, st, [&] {
         sk::native_quantize_q8_1(bf.a, bf.xq, (int) (T * s.n_head * s.head_k), 1, st);
         sk::dsa_grouped_q8_0(w.wk_b, bf.xq, bf.b, s.head_k, s.kv_lora, s.n_head, T, st);
     });
@@ -181,11 +190,11 @@ void run_case(const DsaShapes& s, const HostWeights& hw, const DeviceWeights& dw
         sk::dsa_attend(dc.c, s, bf.a, d_ids, d_steps, T, sc.cap, 1.0f / sqrtf((float) s.head_k), sc.attn, bf.b, st);
         se[6] = stage_f("attend", download(bf.b, D.o_lat.size()), D.o_lat, kF32Tol);
     }
-    se[7] = stage_q("v_b", D.o_lat, T * s.n_head, s.kv_lora, q8_0_max_abs(hw.wv_b), D.o, bf.a, bf.b, st, [&] {
+    se[7] = stage_q("v_b", D.o_lat, T * s.n_head, s.kv_lora, q8_0_max_abs(hw.wv_b), D.o, bf.a, bf.xq, bf.b, st, [&] {
         sk::native_quantize_q8_1(bf.a, bf.xq, (int) (T * s.n_head * s.kv_lora), 1, st);
         sk::dsa_grouped_q8_0(w.wv_b, bf.xq, bf.b, s.kv_lora, s.head_v, s.n_head, T, st);
     });
-    se[8] = stage_q("wo", D.o, T, s.n_head * s.head_v, q8_0_max_abs(hw.wo), D.out, bf.a, bf.b, st, [&] {
+    se[8] = stage_q("wo", D.o, T, s.n_head * s.head_v, q8_0_max_abs(hw.wo), D.out, bf.a, bf.xq, bf.b, st, [&] {
         sk::native_quantize_q8_1(bf.a, bf.xq, H * (int) s.head_v, n, st);
         sk::native_mmvq(8, w.wo, bf.xq, bf.b, H * (int) s.head_v, E, n, st);
     });
@@ -239,13 +248,17 @@ void run_case(const DsaShapes& s, const HostWeights& hw, const DeviceWeights& dw
     std::printf("seed %llu %-4s N %5lld T %lld | stages", (unsigned long long) seed, fmt_name(fmt), (long long) N,
                 (long long) T);
     for (int i = 0; i < kStages; ++i) {
-        const bool pass = se[i].rel <= se[i].tol;
+        const bool pass = se[i].rel <= se[i].tol && se[i].bad == 0;
         std::printf(" %s %.1e%s", se[i].name, se[i].rel, se[i].flips ? "*" : "");
-        if (!pass) { std::printf("(>%.1e)", se[i].tol); ok = false; }
+        if (se[i].rel > se[i].tol) std::printf("(>%.1e)", se[i].tol);
+        if (se[i].bad) std::printf("(%lld codes off the quantizer's rule)", (long long) se[i].bad);
+        if (!pass) ok = false;
         agg.worst[i] = std::max(agg.worst[i], se[i].rel);
         if (se[i].flips == 0) agg.worst_noflip[i] = std::max(agg.worst_noflip[i], se[i].rel);
         agg.worst_ratio[i] = std::max(agg.worst_ratio[i], se[i].rel / se[i].tol);
         agg.flips[i] += se[i].flips;
+        agg.off_rule[i] += se[i].off_rule;
+        agg.bad[i] += se[i].bad;
     }
     std::printf(" | chain");
     double chain_max = 0.0;
@@ -405,10 +418,11 @@ int main(int argc, char** argv) {
     const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     std::printf("\nsummary: %d cases, %d failed (%.0f s)\n", agg.cases, agg.failed, secs);
     std::printf("  stages on the oracle's inputs: worst rel. error / worst without a flipped code / worst error-to-tolerance "
-                "ratio / codes flipped:\n");
+                "ratio / codes flipped / GPU codes one step off the host's roundf(x / d) at a near-tie (CUDA's "
+                "approximate division; 0 on HIP) / off the rule otherwise (must be 0):\n");
     for (int i = 0; i < kStages; ++i)
-        std::printf("    %-8s %.2e  %.2e  %.3f  %lld\n", kStageNames[i], agg.worst[i], agg.worst_noflip[i],
-                    agg.worst_ratio[i], (long long) agg.flips[i]);
+        std::printf("    %-8s %.2e  %.2e  %.3f  %lld  %lld  %lld\n", kStageNames[i], agg.worst[i], agg.worst_noflip[i],
+                    agg.worst_ratio[i], (long long) agg.flips[i], (long long) agg.off_rule[i], (long long) agg.bad[i]);
     std::printf("  chained step (tolerance %.0e; %d of %d cases flip-free, every output <= %.0e):", kChainTol,
                 agg.flip_free, agg.cases, kFlipFree);
     for (int i = 0; i < kChain; ++i) std::printf(" %s %.2e", kChainNames[i], agg.worst_chain[i]);

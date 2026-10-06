@@ -79,12 +79,21 @@ struct Err {
 };
 Err compare(const float* got, const float* ref, int64_t n);
 
-/// Activation quantization: the GPU's Q8_1 (code = roundf(x / d), d = max|x| / 127; Strata's native_quantize_q8_1,
-/// llama.cpp CUDA's quantize_q8_1) and ggml-cpu's x86 Q8_0 (code = rint(x * (127 / max|x|))) give the same codes
-/// except near a rounding tie. For x [cols][n_in] (32-value blocks), returns the largest per-column sum of
-/// d * |code difference| and counts the differing codes: a quantized product's output column then differs by at
-/// most that sum times max |w| beyond f32 rounding.
-double flip_step_sum(const float* x, int64_t cols, int64_t n_in, int64_t* flips);
+/// Activation quantization. A quantized product on the GPU quantizes its activation to Q8_1 (native_quantize_q8_1:
+/// d = max|x| / 127, code = roundf(x / d)), ggml-cpu on x86 to Q8_0 (code = rint(x * (127 / max|x|))); both store d
+/// as f16. The codes agree except near a rounding tie, and there the GPU's own arithmetic decides: CUDA builds the
+/// quantizer with --use_fast_math (llama.cpp CUDA's contract), so both divisions are div.approx.ftz.f32 (2 ulp) and a
+/// quotient within a few ulp of a tie can round either way; HIP divides in IEEE. So the bound is taken from the
+/// GPU's own blocks, read back after the product: for x [cols][n_in] (32-value blocks) and the GPU's Q8_1 blocks of
+/// it, `steps` is the largest per-column sum over the block values of |d_gpu * code_gpu - d_cpu * code_cpu| (f16
+/// scales), and the column of the product then differs by at most steps * max |w| beyond f32 rounding.
+struct FlipBound {
+    double steps = 0.0;
+    int64_t flips = 0;      ///< block values whose GPU and CPU dequantized values differ
+    int64_t off_rule = 0;   ///< GPU codes off the host's roundf(x / d), each one step at a near-tie (CUDA)
+    int64_t bad = 0;        ///< GPU codes or scales no rounding of the rule explains (a broken quantizer or readback)
+};
+FlipBound q8_1_flip_bound(const float* x, const void* gpu_q8_1, int64_t cols, int64_t n_in);
 /// max |w| of a Q8_0 matrix (dequantized).
 double q8_0_max_abs(const std::vector<uint8_t>& w);
 

@@ -344,31 +344,53 @@ Err compare(const float* got, const float* ref, int64_t n) {
     return e;
 }
 
-double flip_step_sum(const float* x, int64_t cols, int64_t n_in, int64_t* flips) {
-    double worst = 0.0;
-    int64_t nf = 0;
+FlipBound q8_1_flip_bound(const float* x, const void* gpu_q8_1, int64_t cols, int64_t n_in) {
+    FlipBound fb;
+    const uint8_t* gq = static_cast<const uint8_t*>(gpu_q8_1);
+    const int64_t nb = n_in / 32;
     for (int64_t c = 0; c < cols; ++c) {
         double sum = 0.0;
-        for (int64_t b = 0; b < n_in / 32; ++b) {
+        for (int64_t b = 0; b < nb; ++b) {
             const float* v = x + c * n_in + b * 32;
+            const uint8_t* blk = gq + (size_t) (c * nb + b) * 36;   // Q8_1: half2 {d, sum}, then 32 int8 codes
+            uint16_t dg_bits;
+            std::memcpy(&dg_bits, blk, 2);
+            const int8_t* qg = reinterpret_cast<const int8_t*>(blk + 4);
             float amax = 0.0f;
             for (int i = 0; i < 32; ++i) amax = std::fmax(amax, std::fabs(v[i]));
-            if (amax == 0.0f) continue;
+            if (amax == 0.0f) {   // both sides: d = 0, every code 0
+                for (int i = 0; i < 32; ++i) fb.bad += qg[i] != 0;
+                fb.bad += (dg_bits & 0x7fff) != 0;
+                continue;
+            }
             const float d = amax / 127.0f, id = 127.0f / amax;
+            const uint16_t dc_bits = k::f16_from_f32(d);   // ggml's Q8_0 d, GGML_CPU_FP32_TO_FP16
+            // the GPU's d is amax / 127 too, divided approximately under CUDA's fast math: one f16 ulp at most
+            if (std::abs((int) dg_bits - (int) dc_bits) > 1 || ((dg_bits ^ dc_bits) & 0x8000)) ++fb.bad;
+            const double dg = k::f32_from_f16(dg_bits), dc = k::f32_from_f16(dc_bits);
             for (int i = 0; i < 32; ++i) {
-                float g = roundf(v[i] / d);
-                g = g > 127.0f ? 127.0f : (g < -127.0f ? -127.0f : g);
+                float r = roundf(v[i] / d);   // the GPU's rule, with IEEE division
+                r = r > 127.0f ? 127.0f : (r < -127.0f ? -127.0f : r);
                 const float cpu = std::nearbyint(v[i] * id);
-                if (g != cpu) {
-                    ++nf;
-                    sum += (double) d * std::fabs((double) g - (double) cpu);
+                if ((float) qg[i] != r) {
+                    // a near-tie only: the exact quotient within 2^-20 of the half-integer between the two codes
+                    // (CUDA's div.approx.f32 is within 2 ulp, twice: d, then v / d)
+                    const double q = (double) v[i] / (double) d, h = 0.5 * ((double) qg[i] + (double) r);
+                    if (std::fabs((double) qg[i] - (double) r) == 1.0 && std::fabs(q - h) <= std::fabs(h) * 0x1p-20)
+                        ++fb.off_rule;
+                    else
+                        ++fb.bad;
+                }
+                const double diff = std::fabs(dg * (double) qg[i] - dc * (double) cpu);
+                if (diff > 0.0) {
+                    ++fb.flips;
+                    sum += diff;
                 }
             }
         }
-        worst = std::max(worst, sum);
+        fb.steps = std::max(fb.steps, sum);
     }
-    if (flips) *flips += nf;
-    return worst;
+    return fb;
 }
 
 double q8_0_max_abs(const std::vector<uint8_t>& w) {

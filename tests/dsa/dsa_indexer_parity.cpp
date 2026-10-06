@@ -48,7 +48,7 @@ struct Agg {
     int64_t kg_diff = 0, kg_total = 0, pooled_ulp = 0, pooled_big = 0, pooled_total = 0;
     double pooled_max_abs = 0.0;
     double worst_score = 0.0, worst_proj[kProjN] = {}, worst_ratio[kProjN] = {}, worst_noflip[kProjN] = {};
-    int64_t proj_flips[kProjN] = {};
+    int64_t proj_flips[kProjN] = {}, proj_off_rule[kProjN] = {}, proj_bad[kProjN] = {};
     int64_t tokens = 0, exact_tokens = 0, near_tie_tokens = 0;
     double min_overlap_iso = 1.0, min_overlap_e2e = 1.0;
     int64_t e2e_tokens = 0, e2e_exact = 0;
@@ -166,7 +166,7 @@ void run_case(const DsaShapes& s, const HostWeights& hw, const DeviceWeights& dw
 
     // 3. the projections on the oracle's inputs
     double perr[kProjN], ptol[kProjN];
-    int64_t pfl[kProjN] = {};
+    int64_t pfl[kProjN] = {}, poff[kProjN] = {}, pbad[kProjN] = {};
     auto proj = [&](int i, const std::vector<float>& x, int64_t cols, int64_t n_in, double max_w,
                     const std::vector<float>& ref, const std::function<void()>& run, double fixed_tol) {
         ck(cudaMemcpy(d_a, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "proj in");
@@ -175,8 +175,17 @@ void run_case(const DsaShapes& s, const HostWeights& hw, const DeviceWeights& dw
         const std::vector<float> got = download(d_b, ref.size());
         const Err e = compare(got.data(), ref.data(), (int64_t) ref.size());
         perr[i] = e.rel;
-        ptol[i] = fixed_tol > 0 ? fixed_tol
-                                : kF32Tol + 1.5 * flip_step_sum(x.data(), cols, n_in, &pfl[i]) * max_w / e.ref_max;
+        if (fixed_tol > 0) {
+            ptol[i] = fixed_tol;
+            return;
+        }
+        // the flip bound from the GPU's own Q8_1 blocks of x (dsa_mla_parity, q8_1_flip_bound)
+        const std::vector<uint8_t> xq = download(static_cast<const uint8_t*>(d_xq), (size_t) (cols * (n_in / 32) * 36));
+        const FlipBound fb = q8_1_flip_bound(x.data(), xq.data(), cols, n_in);
+        pfl[i] = fb.flips;
+        poff[i] = fb.off_rule;
+        pbad[i] = fb.bad;
+        ptol[i] = kF32Tol + 1.5 * fb.steps * max_w / e.ref_max;
     };
     const int E = (int) s.n_embd, n = (int) T;
     const auto& w = dw.w;
@@ -203,7 +212,9 @@ void run_case(const DsaShapes& s, const HostWeights& hw, const DeviceWeights& dw
         if (pfl[i] == 0) agg.worst_noflip[i] = std::max(agg.worst_noflip[i], perr[i]);
         agg.worst_ratio[i] = std::max(agg.worst_ratio[i], perr[i] / ptol[i]);
         agg.proj_flips[i] += pfl[i];
-        if (!(perr[i] <= ptol[i])) ok = false;
+        agg.proj_off_rule[i] += poff[i];
+        agg.proj_bad[i] += pbad[i];
+        if (!(perr[i] <= ptol[i]) || pbad[i]) ok = false;
     }
 
     // 4. end to end: the GPU's own pooled rows again (part 2 replaced them with the oracle's), then dsa_decode
@@ -227,7 +238,11 @@ void run_case(const DsaShapes& s, const HostWeights& hw, const DeviceWeights& dw
 
     std::printf("seed %llu N %5lld T %lld | scores %.1e | sel exact %d/%lld near-tie %d overlap %.4f | proj",
                 (unsigned long long) seed, (long long) N, (long long) T, score_rel, exact, (long long) T, near, ov_iso);
-    for (int i = 0; i < kProjN; ++i) std::printf(" %s %.1e%s", kProj[i], perr[i], pfl[i] ? "*" : "");
+    for (int i = 0; i < kProjN; ++i) {
+        std::printf(" %s %.1e%s", kProj[i], perr[i], pfl[i] ? "*" : "");
+        if (perr[i] > ptol[i]) std::printf("(>%.1e)", ptol[i]);
+        if (pbad[i]) std::printf("(%lld codes off the quantizer's rule)", (long long) pbad[i]);
+    }
     std::printf(" | e2e sel exact %d/%lld overlap %.4f %s\n", e2e_exact, (long long) T, ov_e2e, ok ? "ok" : "FAIL");
     std::fflush(stdout);
     agg.cases++;
@@ -330,10 +345,13 @@ int main(int argc, char** argv) {
     std::printf("  isolated selection: %lld of %lld tokens exact, %lld near-ties, min overlap %.4f\n",
                 (long long) agg.exact_tokens, (long long) agg.tokens, (long long) agg.near_tie_tokens,
                 agg.min_overlap_iso);
-    std::printf("  projections: worst rel. error / worst without a flipped code / error-to-tolerance ratio / codes flipped:\n");
+    std::printf("  projections: worst rel. error / worst without a flipped code / error-to-tolerance ratio / codes flipped / "
+                "GPU codes one step off the host's roundf(x / d) at a near-tie (CUDA's approximate division; 0 on HIP) / "
+                "off the rule otherwise (must be 0):\n");
     for (int i = 0; i < kProjN; ++i)
-        std::printf("    %-8s %.2e  %.2e  %.3f  %lld\n", kProj[i], agg.worst_proj[i], agg.worst_noflip[i],
-                    agg.worst_ratio[i], (long long) agg.proj_flips[i]);
+        std::printf("    %-8s %.2e  %.2e  %.3f  %lld  %lld  %lld\n", kProj[i], agg.worst_proj[i], agg.worst_noflip[i],
+                    agg.worst_ratio[i], (long long) agg.proj_flips[i], (long long) agg.proj_off_rule[i],
+                    (long long) agg.proj_bad[i]);
     std::printf("  end to end selection: %lld of %lld tokens exact, min overlap %.4f\n", (long long) agg.e2e_exact,
                 (long long) agg.e2e_tokens, agg.min_overlap_e2e);
     for (void* p : {(void*) sbase, (void*) d_steps, (void*) d_x, (void*) d_out, (void*) d_a, (void*) d_b, d_xq})
