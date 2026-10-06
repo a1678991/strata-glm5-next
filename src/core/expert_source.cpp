@@ -387,6 +387,15 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
         uint64_t at = 0;
         for (int64_t layer = 0; layer < n_layers; ++layer) {
             const size_t i = (size_t) layer;
+            if (!layout.has_experts(layer)) {   // a dense layer (glm5-next 0-2): an empty range, no blobs
+                if (layout.offset[i] != at || layout.fmt[i].bytes != 0) {
+                    err = "FileExpertSource: the native expert layout is invalid at dense layer " + std::to_string(layer);
+                    return false;
+                }
+                layer_offsets[i] = at;
+                layer_blob_bytes[i] = 0;
+                continue;
+            }
             const uint64_t bytes = (uint64_t) layout.fmt[i].bytes;
             if (layout.offset[i] != at || bytes == 0 || layout.bytes[i] != bytes ||
                 bytes > std::numeric_limits<uint64_t>::max() / (uint64_t) n_expert) {
@@ -629,6 +638,7 @@ bool FileExpertSource::open_gguf(std::string& err) {
     role_bytes_.assign((size_t) (3 * n_layers_), 0);
     role_file_.assign((size_t) (3 * n_layers_), 0);
     for (int64_t l = 0; l < n_layers_; ++l) {
+        if (!lay.has_experts(l)) continue;   // a dense layer: no tensors to map (role_ptr_ stays null)
         const auto& fm = lay.fmt[(size_t) l];
         const uint64_t per[3] = {fm.up_off, fm.up_off, lay.bytes[(size_t) l] - fm.down_off};
         for (int r = 0; r < 3; ++r) {
@@ -1999,6 +2009,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if ((int64_t) d.act_multi.size() < n_tok) d.act_multi.resize((size_t) MAXT);
     const ExpertLayout& lay = expert_layout();
     const bool native = lay.native;
+    // the activation and output rows are the model's n_embd wide: a native layer's own (Qwen 2560, GLM 4096), the
+    // canonical Q2_0 kernels' H (2560)
+    const int64_t HN = native ? lay.fmt[(size_t) d.layers].n_embd : (int64_t) H;
     if (native && d.nact_multi.size() < (size_t) MAXT * kNativeActBytes) d.nact_multi.resize((size_t) MAXT * kNativeActBytes);
     if (d.job_of.size() != (size_t) d.n_expert) d.job_of.assign((size_t) d.n_expert, (int16_t) -1);
     if (d.jobs_multi.size() < (size_t) (n_tok * k)) d.jobs_multi.resize((size_t) (MAXT * k));
@@ -2142,9 +2155,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         for (int64_t t = 0; t < n_tok; ++t) {
             if (ep && std::all_of(kind + t * k, kind + (t + 1) * k, [](int32_t v) { return v >= 0; })) continue;
             if (native && strata::kernels::cpu::q2_native_kernels(lay.fmt[(size_t) d.layers].gu_type))   // a native Q2_0 pack: the Q2_0 kernels' activations
-                act_quant_any(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
+                act_quant_any(x_f + (size_t) t * HN, (int) HN, d.act_multi[(size_t) t]);
             else if (native)
-                native_quant_act(lay.fmt[(size_t) d.layers], x_f + (size_t) t * H, d.nact_multi.data() + (size_t) t * kNativeActBytes);
+                native_quant_act(lay.fmt[(size_t) d.layers], x_f + (size_t) t * HN, d.nact_multi.data() + (size_t) t * kNativeActBytes);
             else
                 act_quant_q8_1(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
         }
@@ -2164,7 +2177,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         for (int64_t j = 0; j < k; ++j) {
             const int64_t i = t * k + j;
             const int64_t e = ids[i];
-            float* row = out + (size_t) i * H;
+            float* row = out + (size_t) i * HN;
             if (e < 0 || e >= d.n_expert) {
                 d.failed = true;
                 d.fail = "a routed expert id is out of range";
@@ -2180,7 +2193,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 // dec_batch: copy_rows_from_mapped_kernel already zeroes kind 0/1 rows on the GPU
                 if (!((kind[i] == 2 && d.peer != nullptr && d.peer->launched_direct()) ||
                       (gpu_zeroes_hits && (kind[i] == 0 || kind[i] == 1))))
-                    std::memset(row, 0, (size_t) H * sizeof(float));
+                    std::memset(row, 0, (size_t) HN * sizeof(float));
                 continue;
             }
             ++d.cache_refused;
@@ -2480,6 +2493,7 @@ bool check_experts_gguf(const std::string& gguf, const strata::kernels::cpu::Exp
     try {
         std::map<std::string, std::unique_ptr<strata::GgufFile>> files;
         for (int64_t l = 0; l < lay.n_layers; ++l) {
+            if (!lay.has_experts(l)) continue;   // a dense layer has no ffn_*_exps tensors
             const auto& fm = lay.fmt[(size_t) l];
             const uint64_t blob = lay.bytes[(size_t) l];
             const uint64_t per[3] = {fm.up_off, fm.up_off, blob - fm.down_off};
@@ -2562,6 +2576,7 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
             for (;;) {
                 const int64_t l = next.fetch_add(1);
                 if (l >= lay.n_layers || bad) break;
+                if (!lay.has_experts(l)) continue;   // a dense layer: nothing to read
                 const auto& fm = lay.fmt[(size_t) l];
                 const uint64_t blob = lay.bytes[(size_t) l];
                 const uint64_t per[3] = {fm.up_off, fm.up_off, blob - fm.down_off};
@@ -2640,6 +2655,7 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
         for (;;) {
             const int64_t l = next.fetch_add(1);
             if (l >= lay.n_layers || bad) break;
+            if (!lay.has_experts(l)) continue;   // a dense layer: nothing to read
             const auto& fm = lay.fmt[(size_t) l];
             const uint64_t blob = lay.bytes[(size_t) l];
             const uint64_t per[3] = {fm.up_off, fm.up_off, blob - fm.down_off};

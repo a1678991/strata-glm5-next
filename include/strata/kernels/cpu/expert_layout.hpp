@@ -33,6 +33,9 @@ struct ExpertLayout {
     uint64_t total = 0;                   ///< experts.bin size
 
     uint64_t blob_bytes(int64_t layer) const { return native ? bytes[(size_t) layer] : (uint64_t) BLOB; }
+    /// False for a layer without routed experts: a native pack's dense layer (glm5-next's 0-2, `n_dense_lead` of
+    /// expert_layout_load), which has no line in native_experts.txt and 0 bytes.  Every Qwen layer has experts.
+    bool has_experts(int64_t layer) const { return !native || bytes[(size_t) layer] != 0; }
     uint64_t layer_offset(int64_t layer) const {
         return native ? offset[(size_t) layer] : (uint64_t) layer * (uint64_t) n_expert * (uint64_t) BLOB;
     }
@@ -74,7 +77,11 @@ void act_quant_any(const float* x, int n, ActQ& a);
 const ExpertLayout& expert_layout();
 /// Reads `<pack_dir>/native_experts.txt` when it exists (a native pack), else sets the canonical layout.
 /// Versions up to kExpertLayoutVersion are read; a newer one is refused (a newer packer wrote it).
-bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err);
+/// `n_embd` / `n_ff` are the model geometry's expert widths (Qwen 2560 / 640, the canonical H / FF; GLM 4096 / 2048):
+/// every layer's formats are checked at these widths.  `n_dense_lead`: the first layers have no experts (GLM's dense
+/// layers 0-2); a native pack has no line for them and they hold 0 bytes.
+bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err,
+                        int64_t n_embd = H, int64_t n_ff = FF, int64_t n_dense_lead = 0);
 /// The newest native_experts.txt this engine reads.  v4 = v3 plus the per-role shard column `gate,up,down`,
 /// written only when some layer's roles are in different shards (every other pack stays v3, byte for byte).
 inline constexpr int kExpertLayoutVersion = 4;

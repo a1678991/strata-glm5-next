@@ -1234,6 +1234,68 @@ double pcie_frac_for_gbps(double gbps, double base) {
     return gbps <= 0.0 ? base : base * std::min(1.0, gbps / 20.0);
 }
 
+// glm5-next (GLM-5.3-Flash, the fork's second model): the model file's header, its geometry and its tensor directory
+// are read and checked against each other and printed, and the run stops - the layer kernels (KDA, DSA/MLA, mHC, the
+// sigmoid router) are not written yet.  Headers only: nothing is allocated on a GPU and no expert is mapped or read.
+// -1: `any_shard` is not a glm5-next file (a qwen4exp file, or one the --native block reports as before).
+int glm5_next_preflight(const std::string& any_shard, const std::string& pack) {
+    std::vector<std::string> shards;
+    try {
+        shards = strata::gguf_split_paths(any_shard);
+        const strata::GgufFile meta(shards.front());
+        const strata::MetaValue* arch = meta.get("general.architecture");
+        if (arch == nullptr || arch->s != "glm5-next") return -1;
+    } catch (const std::exception&) {
+        return -1;
+    }
+    try {
+        const strata::GgufModel model(shards);
+        strata::core::ModelGeometry g;
+        std::string err;
+        if (!strata::core::geometry_from_gguf(model.meta(), g, err)) {
+            std::fprintf(stderr, "strata generate: --native %s: %s\n", any_shard.c_str(), err.c_str());
+            return 1;
+        }
+        size_t tensors = 0;
+        for (size_t i = 0; i < model.size(); ++i) tensors += model.shard(i).tensors().size();
+        const strata::MetaValue* name = model.meta().get("general.name");
+        std::fprintf(stderr, "strata generate: --native %s: glm5-next (%s), %zu shard%s, %zu tensors\n",
+                     any_shard.c_str(), name != nullptr ? name->s.c_str() : "unnamed", model.size(),
+                     model.size() == 1 ? "" : "s", tensors);
+        std::fputs(strata::core::describe_geometry(g, "strata generate: ").c_str(), stderr);
+        int64_t checked = 0;
+        if (!strata::core::check_all_gguf(model, g, err, &checked)) {
+            std::fprintf(stderr, "strata generate: glm5-next: the tensor directory does not match the geometry: %s\n",
+                         err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "strata generate: glm5-next: %lld of the file's %zu tensors checked against the geometry\n",
+                     (long long) checked, tensors);
+        // the pack's expert layout, when it has one (tools/iq_pack.py): read at the geometry's widths with the dense
+        // layers left out, and every layer's expert spans checked against the shards' headers - nothing is mapped
+        if (std::FILE* f = std::fopen((pack + "/native_experts.txt").c_str(), "rb")) {
+            std::fclose(f);
+            if (!strata::kernels::cpu::expert_layout_load(pack, g.n_layers, g.n_expert, err, g.n_embd, g.n_ff,
+                                                          g.n_dense_lead) ||
+                !strata::core::check_experts_gguf(shards.front(), strata::kernels::cpu::expert_layout(), err)) {
+                std::fprintf(stderr, "strata generate: glm5-next: %s: %s\n", pack.c_str(), err.c_str());
+                return 1;
+            }
+            const auto& lay = strata::kernels::cpu::expert_layout();
+            std::fprintf(stderr, "strata generate: glm5-next: %s: %lld x %lld experts in layers %lld-%lld, %.2f GiB, "
+                                 "largest blob %.2f MB, every span checked against the shards\n",
+                         pack.c_str(), (long long) (g.n_layers - g.n_dense_lead), (long long) lay.n_expert,
+                         (long long) g.n_dense_lead, (long long) g.n_layers - 1, (double) lay.total / 1073741824.0,
+                         (double) lay.max_blob / 1e6);
+        }
+        std::fprintf(stderr, "strata generate: glm5-next: layer kernels not implemented yet\n");
+        return 1;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "strata generate: --native %s: %s\n", any_shard.c_str(), e.what());
+        return 2;
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1543,6 +1605,9 @@ int main(int argc, char** argv) {
         }
         }
     }
+    // glm5-next: header, geometry and tensor directory, then a clear stop - before any GPU call (glm5_next_preflight)
+    if (!o.native_preset.empty())
+        if (const int rc = glm5_next_preflight(o.native_preset, o.pack); rc >= 0) return rc;
     strata::core::set_coupled_draft(o.coupled_draft);
     strata::core::set_peer_portable(o.peer_device >= 1);   // multi-GPU: the Portable flag on mapped host buffers only with a peer device (before any allocation)
     if (o.serve && o.conversation_cache_mib > 0 && (o.prompt_cache == 0 || o.conversation_cache_slots == 0))
@@ -2008,7 +2073,8 @@ int main(int argc, char** argv) {
     // come from the model file) and runs its experts in verify windows only (--spec).
     {
         const strata::core::ModelGeometry g0;
-        if (!strata::kernels::cpu::expert_layout_load(o.pack, g0.n_layers, g0.n_expert, err)) {
+        if (!strata::kernels::cpu::expert_layout_load(o.pack, g0.n_layers, g0.n_expert, err, g0.n_embd, g0.n_ff,
+                                                      g0.n_dense_lead)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
@@ -2018,6 +2084,7 @@ int main(int argc, char** argv) {
         const auto& lay = strata::kernels::cpu::expert_layout();
         for (int64_t l = 0; lay.native && l < (int64_t) lay.fmt.size(); ++l) {
             const auto& f = lay.fmt[(size_t) l];
+            if (lay.bytes[(size_t) l] == 0) continue;   // a dense layer (GLM's 0-2): no experts
             if (!strata::kernels::native_expert_supported(f.gu_type, f.d_type, f.n_embd, f.n_ff)) {
                 std::fprintf(stderr, "strata generate: layer %lld's experts are %s/%s (ggml types %d/%d), which this "
                                      "engine has no GPU kernels for\n", (long long) l,
@@ -2089,8 +2156,12 @@ int main(int argc, char** argv) {
             // is the authority on its own MoE shape - everything else in the geometry is unchanged
             try {
                 strata::GgufFile model_gguf(o.native_shards.front());   // the metadata shard
-                if (const strata::MetaValue* v = model_gguf.get("qwen4exp.expert_count")) g.n_expert = (int64_t) v->u;
-                if (const strata::MetaValue* v = model_gguf.get("qwen4exp.expert_used_count")) K = (int64_t) v->u;
+                // qwen4exp.expert_count / expert_used_count, as always (layout.hpp: geometry_from_gguf)
+                if (!strata::core::geometry_from_gguf(model_gguf, g, err)) {
+                    std::fprintf(stderr, "strata generate: %s: %s\n", o.native_preset.c_str(), err.c_str());
+                    return 1;
+                }
+                K = g.n_expert_used;
                 if (const strata::MetaValue* v = model_gguf.get("qwen4exp.rope.freq_base")) gguf_rope_base = v->num();
                 if (const strata::MetaValue* v = model_gguf.get("qwen4exp.rope.scaling.type")) gguf_rope_type = v->s;
                 if (const strata::MetaValue* v = model_gguf.get("qwen4exp.rope.scaling.factor")) gguf_rope_factor = v->num();
@@ -2182,9 +2253,9 @@ int main(int argc, char** argv) {
                                  "and --prefill CHUNK\n", o.pack.c_str());
             return 2;
         }
-        const strata::core::ModelGeometry g0;
-        if (!native_embed.load(o.embd_gguf.empty() ? o.native_shards : std::vector<std::string>{o.embd_gguf}, g0.n_embd,
-                               248320, err)) {
+        // the model geometry's width and vocabulary (qwen4exp: 2560 x 248320, as before)
+        if (!native_embed.load(o.embd_gguf.empty() ? o.native_shards : std::vector<std::string>{o.embd_gguf}, g.n_embd,
+                               g.n_vocab, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }

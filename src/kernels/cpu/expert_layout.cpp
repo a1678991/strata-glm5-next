@@ -230,7 +230,8 @@ void native_gu_rows(const NativeFmt&, const uint8_t*, const void* const*, int, f
 void native_down_rows(const NativeFmt&, const uint8_t*, const void* const*, int, float* const*, int, int) { std::abort(); }
 #endif
 
-bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err) {
+bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err,
+                        int64_t n_embd, int64_t n_ff, int64_t n_dense_lead) {
     ExpertLayout L;
     L.n_layers = n_layers;
     L.n_expert = n_expert;
@@ -241,6 +242,9 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
         return true;
     }
 #if !defined(STRATA_NATIVE_EXPERTS)
+    (void) n_embd;
+    (void) n_ff;
+    (void) n_dense_lead;
     err = "this pack has native (IQ) experts but the engine was built without STRATA_NATIVE_EXPERTS";
     return false;
 #else
@@ -280,8 +284,18 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
             err = "native_experts.txt: a malformed line: " + line;
             return false;
         }
+        if (l < n_dense_lead) {
+            err = "native_experts.txt: layer " + std::to_string(l) + " is a dense layer of this model and has no experts";
+            return false;
+        }
         NativeFmt f;
-        if (!native_fmt((int) gt, (int) dt, H, FF, f, err)) return false;
+        if (!native_fmt((int) gt, (int) dt, n_embd, n_ff, f, err)) return false;
+        // the Q2_0 rows run on Strata's own kernels, whose activation (ActQ) holds H = 2560 values
+        if ((f.gu_type == 42 && n_embd > H) || (f.d_type == 42 && n_ff > H)) {
+            err = "native_experts.txt: layer " + std::to_string(l) + ": Q2_0 experts wider than " + std::to_string(H) +
+                  " values are not supported";
+            return false;
+        }
         if (f.bytes != blob) {
             err = "native_experts.txt: layer " + std::to_string(l) + " blob is " + std::to_string(blob) +
                   " B but its formats make " + std::to_string(f.bytes);
@@ -326,6 +340,10 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
     }
     uint64_t at = 0;
     for (int64_t l = 0; l < n_layers; ++l) {
+        if (l < n_dense_lead && L.offset[(size_t) l] == ~0ull) {
+            L.offset[(size_t) l] = at;   // no experts: an empty range where the next layer's begin
+            continue;
+        }
         if (L.offset[(size_t) l] != at) {
             err = "native_experts.txt: layer " + std::to_string(l) + " is missing or not contiguous";
             return false;

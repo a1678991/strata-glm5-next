@@ -54,8 +54,11 @@ int main(int argc, char** argv) {
                 if (!(nb <= end && end < nb + 32)) ++bad;
             }
             std::printf("  geometry bracket: %zu out of range, %zu types unknown\n", bad, unknown);
-            const std::string err = strata::check_architecture(g);
-            std::printf("  architecture guard: %s\n", err.empty() ? "PASS" : ("FAIL - " + err).c_str());
+            strata::ModelArch arch = strata::ModelArch::Unknown;
+            const std::string err = strata::check_model_architecture(g, &arch);
+            std::printf("  architecture guard: %s\n",
+                        !err.empty() ? ("FAIL - " + err).c_str()
+                                     : arch == strata::ModelArch::Qwen4Exp ? "PASS" : "PASS (glm5-next)");
             if (bad) return 1;
         }
         return 0;
