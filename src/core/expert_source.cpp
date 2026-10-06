@@ -77,7 +77,7 @@ bool make_cache_complement_plan(
     int64_t n_layers, int64_t n_expert, const std::vector<uint64_t>& layer_blob_bytes,
     const std::vector<std::pair<int32_t, int32_t>>& primary_gpu_pairs,
     const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs,
-    std::vector<uint64_t>& offsets, uint64_t& bytes, std::string& err) {
+    std::vector<uint64_t>& offsets, uint64_t& bytes, std::string& err, bool allow_empty_layers) {
     offsets.clear();
     bytes = 0;
     err.clear();
@@ -113,16 +113,23 @@ bool make_cache_complement_plan(
     };
     if (!mark_pairs(primary_gpu_pairs, 1, "primary GPU") ||
         !mark_pairs(additional_gpu_pairs, 2, "additional GPU")) return false;
-    for (uint64_t blob_bytes : layer_blob_bytes) {
-        if (blob_bytes == 0) {
+    for (size_t layer = 0; layer < layer_blob_bytes.size(); ++layer) {
+        if (layer_blob_bytes[layer] != 0) continue;
+        if (!allow_empty_layers) {
             err = "FileExpertSource: cache complement layer has zero-sized expert blobs";
             return false;
         }
+        for (int64_t expert = 0; expert < n_expert; ++expert)
+            if (omitted[layer * (size_t) n_expert + (size_t) expert] != 0) {
+                err = "FileExpertSource: a GPU pair names a layer without experts";
+                return false;
+            }
     }
 
     offsets.assign(count, kNoCacheComplement);
     for (int64_t layer = 0; layer < n_layers; ++layer) {
         const uint64_t blob_bytes = layer_blob_bytes[(size_t) layer];
+        if (blob_bytes == 0) continue;   // a layer without experts (allow_empty_layers): nothing to hold
         for (int64_t expert = 0; expert < n_expert; ++expert) {
             const size_t index = (size_t) layer * (size_t) n_expert + (size_t) expert;
             if (omitted[index] != 0) continue;
@@ -1375,7 +1382,7 @@ bool FileExpertSource::pin_cache_complement(
     std::vector<uint64_t> offsets;
     uint64_t bytes = 0;
     if (!detail::make_cache_complement_plan(n_layers_, n_expert_, layer_blob_bytes_, primary_gpu_pairs,
-                                            additional_gpu_pairs, offsets, bytes, err)) return false;
+                                            additional_gpu_pairs, offsets, bytes, err, true)) return false;
 #if defined(_WIN32)
     // #467: the GPU cache's pre-fill touched its experts through the mapping (~19 GiB on a 24 GB card), and Windows
     // counts those file pages in this process's working set, not as available: a 32 GB PC read 0.44 GiB here
@@ -1482,7 +1489,7 @@ bool FileExpertSource::pin_cache_complement(
             for (size_t i = 0; i < primary_gpu_pairs.size(); ++i)
                 if (pair_slot[i] < keep_from) core.push_back(primary_gpu_pairs[i]);
             if (!detail::make_cache_complement_plan(n_layers_, n_expert_, layer_blob_bytes_, core,
-                                                    additional_gpu_pairs, offsets, bytes, err)) return false;
+                                                    additional_gpu_pairs, offsets, bytes, err, true)) return false;
         }
     }
 

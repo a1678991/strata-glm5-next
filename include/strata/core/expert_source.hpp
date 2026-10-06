@@ -83,11 +83,14 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo = "/proc/me
 
 /// Build compact offsets for experts absent from both the primary GPU cache and an optional second GPU tier.
 /// Kept CPU-only so selection and byte accounting can be tested without initializing a GPU.
+/// `allow_empty_layers`: a 0-byte layer is a layer without routed experts (glm5-next's dense layers 0-2, which
+/// native_experts.txt leaves out): none of its experts is in the complement and a GPU pair in it is refused.  Without
+/// it (the default) a 0-byte layer is refused, as before.  Every Qwen layer has experts, so the plan is the same.
 bool make_cache_complement_plan(
     int64_t n_layers, int64_t n_expert, const std::vector<uint64_t>& layer_blob_bytes,
     const std::vector<std::pair<int32_t, int32_t>>& primary_gpu_pairs,
     const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs,
-    std::vector<uint64_t>& offsets, uint64_t& bytes, std::string& err);
+    std::vector<uint64_t>& offsets, uint64_t& bytes, std::string& err, bool allow_empty_layers = false);
 
 /// Resolve one blob through the compact copy when present, otherwise preserve its exact mapped-file fallback.
 const uint8_t* cache_complement_blob_or_fallback(
