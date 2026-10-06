@@ -1238,7 +1238,7 @@ double pcie_frac_for_gbps(double gbps, double base) {
 // are read and checked against each other and printed, and the run stops - the layer kernels (KDA, DSA/MLA, mHC, the
 // sigmoid router) are not written yet.  Headers only: nothing is allocated on a GPU and no expert is mapped or read.
 // -1: `any_shard` is not a glm5-next file (a qwen4exp file, or one the --native block reports as before).
-int glm5_next_preflight(const std::string& any_shard) {
+int glm5_next_preflight(const std::string& any_shard, const std::string& pack) {
     std::vector<std::string> shards;
     try {
         shards = strata::gguf_split_paths(any_shard);
@@ -1271,6 +1271,23 @@ int glm5_next_preflight(const std::string& any_shard) {
         }
         std::fprintf(stderr, "strata generate: glm5-next: %lld of the file's %zu tensors checked against the geometry\n",
                      (long long) checked, tensors);
+        // the pack's expert layout, when it has one (tools/iq_pack.py): read at the geometry's widths with the dense
+        // layers left out, and every layer's expert spans checked against the shards' headers - nothing is mapped
+        if (std::FILE* f = std::fopen((pack + "/native_experts.txt").c_str(), "rb")) {
+            std::fclose(f);
+            if (!strata::kernels::cpu::expert_layout_load(pack, g.n_layers, g.n_expert, err, g.n_embd, g.n_ff,
+                                                          g.n_dense_lead) ||
+                !strata::core::check_experts_gguf(shards.front(), strata::kernels::cpu::expert_layout(), err)) {
+                std::fprintf(stderr, "strata generate: glm5-next: %s: %s\n", pack.c_str(), err.c_str());
+                return 1;
+            }
+            const auto& lay = strata::kernels::cpu::expert_layout();
+            std::fprintf(stderr, "strata generate: glm5-next: %s: %lld x %lld experts in layers %lld-%lld, %.2f GiB, "
+                                 "largest blob %.2f MB, every span checked against the shards\n",
+                         pack.c_str(), (long long) (g.n_layers - g.n_dense_lead), (long long) lay.n_expert,
+                         (long long) g.n_dense_lead, (long long) g.n_layers - 1, (double) lay.total / 1073741824.0,
+                         (double) lay.max_blob / 1e6);
+        }
         std::fprintf(stderr, "strata generate: glm5-next: layer kernels not implemented yet\n");
         return 1;
     } catch (const std::exception& e) {
@@ -1590,7 +1607,7 @@ int main(int argc, char** argv) {
     }
     // glm5-next: header, geometry and tensor directory, then a clear stop - before any GPU call (glm5_next_preflight)
     if (!o.native_preset.empty())
-        if (const int rc = glm5_next_preflight(o.native_preset); rc >= 0) return rc;
+        if (const int rc = glm5_next_preflight(o.native_preset, o.pack); rc >= 0) return rc;
     strata::core::set_coupled_draft(o.coupled_draft);
     strata::core::set_peer_portable(o.peer_device >= 1);   // multi-GPU: the Portable flag on mapped host buffers only with a peer device (before any allocation)
     if (o.serve && o.conversation_cache_mib > 0 && (o.prompt_cache == 0 || o.conversation_cache_slots == 0))
