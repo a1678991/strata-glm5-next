@@ -48,3 +48,16 @@ else()
   message(STATUS "strata: STRATA_GLM_ORACLE_DIR / STRATA_GLM_ORACLE_BUILD_DIR not set - the GLM kernel parity tests "
                  "against ggml-cpu f1cee99 (${_glm_oracle_tests}) are NOT registered (tools/glm/build_oracle.sh)")
 endif()
+
+# The routed-expert changes (clamp epilogue, Q6_K down rows) on the GPU and the CPU pool: ggml here is Strata's own
+# pinned one (strata_kernels_cpu), whose Q6_K arithmetic is f1cee99's.  expert_dump is the Qwen bit-identity tool: its
+# output, built once against the base tree and once against this one, must be byte-identical (see its header).
+if(STRATA_NATIVE_EXPERTS)
+  foreach(_t IN ITEMS expert_parity expert_dump)
+    add_executable(glm_${_t} tests/glm/${_t}.cpp)
+    target_include_directories(glm_${_t} PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(glm_${_t} PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+  endforeach()
+  add_test(NAME glm_expert_parity COMMAND glm_expert_parity)
+  set_tests_properties(glm_expert_parity PROPERTIES TIMEOUT 900)
+endif()

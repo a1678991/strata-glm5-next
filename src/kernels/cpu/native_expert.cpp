@@ -2,6 +2,7 @@
 // See the header.  Nothing here is Strata arithmetic: the activation quantizers and the row dot products are
 // ggml-cpu's, so an IQ expert computes what llama.cpp's CPU backend computes for it.
 #include "strata/kernels/cpu/native_expert.hpp"
+#include "strata/kernels/cpu/native_expert_clamp.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/iq_avx512.hpp"
 #include "strata/kernels/cpu/iq_avx2.hpp"
@@ -78,6 +79,11 @@ void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
 
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1) {
+    native_gu_rows_clamp(f, blob, act, nt, ff, r0, r1, 0.0f);
+}
+
+void native_gu_rows_clamp(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
+                          int r0, int r1, float limit) {
     // the multi-token kernels decode the weights once for all tokens: 2.0-2.4x ggml-cpu at three tokens, no faster
     // at one (all are bound by the codebook lookups, ~5 GB/s per core), measured by native_expert_parity.  AVX-512
     // first, then the AVX-2 one (Zen 2/3, Intel 12th-14th gen).  STRATA_NO_IQ512 drops an AVX-512 CPU to the
@@ -102,7 +108,7 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     // ~1.4 tokens and the weights stay in L1 across ggml's per-token calls; 1.01-1.13x in native_expert_parity).
     static const bool kq = [] { const char* v = std::getenv("STRATA_KQ256"); return cpu_avx2_ok() && v != nullptr && std::atoi(v) != 0; }();
     if (kq && f.gu_type == 12 && nt >= 2) {   // one token: ggml's own dot below (the same bits, less overhead)
-        kq256_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
+        kq256_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1, limit);
         return;
     }
     // A format with only an AVX-2 kernel (IQ4_XS, #415) takes it on AVX-2 CPUs only: an AVX-512 CPU keeps ggml-cpu for
@@ -111,16 +117,29 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     static const bool cpu512 = cpu_avx512_ok();
     if (nt >= mt_min && (iq512_supported(f.gu_type) || (!cpu512 && iq256_supported(f.gu_type)))) {
         if (avx512 && iq512_supported(f.gu_type)) {
-            iq512_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
+            iq512_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1, limit);
             return;
         }
         if (avx2 && iq256_supported(f.gu_type)) {
-            iq256_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
+            iq256_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1, limit);
             return;
         }
     }
     const ggml_vec_dot_t dot = traits(f.gu_type)->vec_dot;
     const int n = (int) f.n_embd;
+    if (limit > 0.0f) {   // GLM-5.3-Flash: the same dots, the clamped SwiGLU
+        for (int r = r0; r < r1; ++r) {
+            const uint8_t* gr = blob + (size_t) r * f.gu_row;
+            const uint8_t* ur = blob + f.up_off + (size_t) r * f.gu_row;
+            for (int t = 0; t < nt; ++t) {
+                float g = 0.f, u = 0.f;
+                dot(n, &g, 0, gr, 0, act[t], 0, 1);
+                dot(n, &u, 0, ur, 0, act[t], 0, 1);
+                ff[t][r] = swiglu_clamped(g, u, limit);
+            }
+        }
+        return;
+    }
     for (int r = r0; r < r1; ++r) {
         const uint8_t* gr = blob + (size_t) r * f.gu_row;
         const uint8_t* ur = blob + f.up_off + (size_t) r * f.gu_row;
