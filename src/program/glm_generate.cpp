@@ -21,6 +21,9 @@
 //   STRATA_GLM_PROFILE=1      per-layer GPU times
 //   STRATA_GLM_NODES=<dir>, STRATA_GLM_NODES_LAYER=l   the intermediate nodes of layer l (glm.hpp set_node_dump),
 //                             named as llama.cpp's, for glm-splice --dump of the same names
+//   STRATA_GLM_MARK_EVERY=N, STRATA_GLM_MARKS=a,b,...   a timing line at every N-th token and at the listed
+//                             positions (the first window that reaches each): seconds since the first window, and the
+//                             tier counters so far (cumulative; differences between two marks give a segment's rate)
 #include "strata/program/glm_generate.hpp"
 
 #include "strata/artifact/gguf_reader.hpp"
@@ -270,6 +273,17 @@ int glm_generate(const GlmRunArgs& a) {
     const double load_s = std::chrono::duration<double>(Clock::now() - t_start).count();
     std::fprintf(stderr, "strata generate: glm5-next: loaded in %.1f s; reading %lld tokens in windows of %d\n", load_s,
                  (long long) n, T);
+    // STRATA_GLM_MARK_EVERY / STRATA_GLM_MARKS: timing lines while the tokens are read (no effect on the numbers)
+    std::vector<int64_t> marks;
+    if (const char* v = std::getenv("STRATA_GLM_MARKS"); v != nullptr && *v) {
+        std::stringstream ss(v);
+        std::string item;
+        while (std::getline(ss, item, ',')) if (!item.empty()) marks.push_back(std::atoll(item.c_str()));
+    }
+    if (const char* v = std::getenv("STRATA_GLM_MARK_EVERY"); v != nullptr && std::atoll(v) > 0)
+        for (int64_t m = std::atoll(v); m < n; m += std::atoll(v)) marks.push_back(m);
+    std::sort(marks.begin(), marks.end());
+    size_t next_mark = 0;
     const auto t0 = Clock::now();
     int64_t agree = 0, rows = 0;
     for (int64_t q = 0; q < n;) {
@@ -293,6 +307,17 @@ int glm_generate(const GlmRunArgs& a) {
         }
         if (!eng.commit(Tq, err)) return fail(err);
         q += Tq;
+        if (next_mark < marks.size() && q >= marks[next_mark]) {
+            while (next_mark < marks.size() && q >= marks[next_mark]) ++next_mark;
+            cudaDeviceSynchronize();
+            const double ts = std::chrono::duration<double>(Clock::now() - t0).count();
+            std::fprintf(stderr, "strata generate: glm5-next: mark %lld tokens %.3f s", (long long) q, ts);
+            if (any_moe)
+                std::fprintf(stderr, "; %s; file tier: %lld reads, %.1f MB, %.1f ms; RAM tier reads %lld",
+                             experts.stats_line().c_str(), (long long) src.file_reads(),
+                             (double) src.file_read_bytes() / 1e6, src.file_ms(), (long long) src.ram_reads());
+            std::fprintf(stderr, "\n");
+        }
     }
     const double s = std::chrono::duration<double>(Clock::now() - t0).count();
     if (logpos != nullptr) std::fclose(logpos);
