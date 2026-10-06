@@ -142,7 +142,10 @@ public:
 
     /// One window: tokens[0..T) at positions pos0.. through layers [0, n_run) and, when every layer ran, the head.
     /// Synchronizes before returning.  The KDA state is not advanced until `commit`.
-    bool run(int T, const int32_t* tokens, int64_t pos0, std::string& err);
+    /// `x_in` (host, [T][hc][n_embd], optional): the streams entering layer `from` instead of the embedding - the
+    /// rows of llama.cpp's l_out-<from - 1>, so that layers [from, n_run) are checked on the reference's input alone.
+    bool run(int T, const int32_t* tokens, int64_t pos0, std::string& err, const float* x_in = nullptr,
+             int64_t from = 0);
     /// Keep the first n_keep (1..T) tokens of the last window.
     bool commit(int n_keep, std::string& err);
 

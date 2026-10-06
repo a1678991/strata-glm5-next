@@ -507,7 +507,7 @@ bool GlmEngine::head(int T, std::string& err) {
     return true;
 }
 
-bool GlmEngine::run(int T, const int32_t* tokens, int64_t pos0, std::string& err) {
+bool GlmEngine::run(int T, const int32_t* tokens, int64_t pos0, std::string& err, const float* x_in, int64_t from) {
     if (T < 1 || T > cfg_.max_t) { err = "glm: window of " + std::to_string(T) + " tokens"; return false; }
     if (pos0 < 0 || pos0 + T > cfg_.max_cells) {
         err = "glm: positions " + std::to_string(pos0) + ".." + std::to_string(pos0 + T - 1) + " exceed the context (" +
@@ -524,13 +524,21 @@ bool GlmEngine::run(int T, const int32_t* tokens, int64_t pos0, std::string& err
         sk::dsa_step_fill(h_steps_, pos0, T, dshape_);
         cudaMemcpyAsync(steps_, h_steps_, (size_t) T * sk::kStepCount * 4, cudaMemcpyHostToDevice, st);
     }
-    // hc_init: the embedding repeated into every stream
-    embed_->gather_dev(tok_, T, emb_, st);
-    const size_t row = (size_t) g_.n_embd * 4;
-    for (int64_t h = 0; h < g_.hc; ++h)
-        cudaMemcpy2DAsync(x_ + h * g_.n_embd, row * (size_t) g_.hc, emb_, row, row, (size_t) T, cudaMemcpyDeviceToDevice,
-                          st);
-    for (int64_t l = 0; l < n_run_; ++l) {
+    if (x_in != nullptr) {   // the reference's streams entering layer `from`
+        if (from < 0 || from >= n_run_) { err = "glm: input layer out of range"; return false; }
+        cudaMemcpyAsync(x_, x_in, (size_t) T * g_.hc * g_.n_embd * 4, cudaMemcpyHostToDevice, st);
+    } else {
+        from = 0;
+        // hc_init: the embedding repeated into every stream
+        embed_->gather_dev(tok_, T, emb_, st);
+        const size_t row = (size_t) g_.n_embd * 4;
+        for (int64_t h = 0; h < g_.hc; ++h)
+            cudaMemcpy2DAsync(x_ + h * g_.n_embd, row * (size_t) g_.hc, emb_, row, row, (size_t) T,
+                              cudaMemcpyDeviceToDevice, st);
+    }
+    for (int64_t l = 0; l < from; ++l)
+        if (prof_) cudaEventRecord((cudaEvent_t) ev_[(size_t) l], st);
+    for (int64_t l = from; l < n_run_; ++l) {
         if (prof_) cudaEventRecord((cudaEvent_t) ev_[(size_t) l], st);
         if (!layer(l, T, err)) return false;
         if (GlmtWriter* w = dump_[(size_t) l]) {

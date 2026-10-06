@@ -15,7 +15,9 @@
 //                             (validate/scripts/glmt.py; glm-splice --replace l_out-<l>=<file>)
 //   STRATA_GLM_DUMP_LAYERS=a,b,...   only these layers (default: every layer that runs)
 //   STRATA_GLM_LAYERS=N       run layers 0..N-1 only (no head unless N is the whole model): a stage's check
+//   STRATA_GLM_FROM=i, STRATA_GLM_INPUT=<file>   layers i..N-1 only, on the rows of <file> (llama.cpp's l_out-(i-1))
 //   STRATA_GLM_KV=f16         the DSA latent in f16 (the parity layout) instead of int8
+//   STRATA_GLM_LOGITS=<file> every position's full logits (GLMT, glm-splice --logits' format)
 //   STRATA_GLM_PROFILE=1      per-layer GPU times
 //   STRATA_GLM_NODES=<dir>, STRATA_GLM_NODES_LAYER=l   the intermediate nodes of layer l (glm.hpp set_node_dump),
 //                             named as llama.cpp's, for glm-splice --dump of the same names
@@ -37,6 +39,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <set>
 #include <sstream>
@@ -233,6 +236,34 @@ int glm_generate(const GlmRunArgs& a) {
         return p != nullptr ? (int32_t) std::atoi(p) : (int32_t) 248046;
     }();
 
+    // STRATA_GLM_FROM=i STRATA_GLM_INPUT=<llama.cpp's l_out-(i-1).glmt>: layers [i, n_run) on the reference's input
+    int64_t from = 0;
+    std::FILE* x_file = nullptr;
+    std::vector<float> x_in;
+    if (const char* v = std::getenv("STRATA_GLM_FROM"); v != nullptr && *v) {
+        from = std::atoll(v);
+        const char* in = std::getenv("STRATA_GLM_INPUT");
+        if (from < 1 || from >= n_run || in == nullptr) return fail("STRATA_GLM_FROM needs 1..n_run-1 and STRATA_GLM_INPUT");
+        x_file = std::fopen(in, "rb");
+        char hdr[128];
+        uint64_t row_elems = 0, rows = 0;
+        if (x_file == nullptr || std::fread(hdr, 1, 128, x_file) != 128 || std::string(hdr, 4) != "GLMT")
+            return fail(std::string("cannot read the GLMT input ") + in);
+        std::memcpy(&row_elems, hdr + 16, 8);
+        std::memcpy(&rows, hdr + 24, 8);
+        if (row_elems != (uint64_t) (g.hc * g.n_embd) || rows < a.tokens.size())
+            return fail(std::string(in) + ": rows of the wrong size or too few");
+        x_in.resize((size_t) T * g.hc * g.n_embd);
+    }
+    // STRATA_GLM_LOGITS=<file>: every position's full logits (GLMT, as glm-splice --logits), for a full-vocab KLD
+    std::unique_ptr<sc::GlmtWriter> logits_out;
+    std::vector<float> lrow;
+    if (const char* p = std::getenv("STRATA_GLM_LOGITS"); p != nullptr && *p) {
+        if (!full) return fail("STRATA_GLM_LOGITS needs the whole model");
+        logits_out = std::make_unique<sc::GlmtWriter>();
+        if (!logits_out->create(p, "logits", g.n_vocab, 1, err)) return fail(err);
+        lrow.resize((size_t) g.n_vocab);
+    }
     // ---- the prompt, teacher-forced through the windows
     const int64_t n = (int64_t) a.tokens.size();
     std::vector<int32_t> win((size_t) T), nxt((size_t) T);
@@ -247,8 +278,13 @@ int glm_generate(const GlmRunArgs& a) {
             win[(size_t) t] = (int32_t) a.tokens[(size_t) (q + t)];
             nxt[(size_t) t] = q + t + 1 < n ? (int32_t) a.tokens[(size_t) (q + t + 1)] : -1;
         }
-        if (!eng.run(Tq, win.data(), q, err)) return fail(err);
+        if (x_file != nullptr &&
+            std::fread(x_in.data(), sizeof(float), (size_t) Tq * g.hc * g.n_embd, x_file) != (size_t) Tq * g.hc * g.n_embd)
+            return fail("reading the GLMT input");
+        if (!eng.run(Tq, win.data(), q, err, x_file != nullptr ? x_in.data() : nullptr, from)) return fail(err);
         if (logpos != nullptr && !eng.window_logprobs(nxt.data(), Tq, q, extra, logpos, err)) return fail(err);
+        for (int t = 0; logits_out && t < Tq; ++t)
+            if (!eng.copy_logits(t, lrow.data()) || !logits_out->append(lrow.data(), 1)) return fail("logits dump");
         if (full && a.stats) {
             int32_t am[8];
             if (!eng.argmax(Tq, am)) return fail("argmax");
@@ -262,6 +298,7 @@ int glm_generate(const GlmRunArgs& a) {
     if (logpos != nullptr) std::fclose(logpos);
     for (auto& w : writers)
         if (w && !w->finish()) return fail("closing a dump file");
+    if (logits_out && !logits_out->finish()) return fail("closing the logits dump");
     std::fprintf(stderr, "strata generate: glm5-next: %lld tokens in %.2f s: %.2f tok/s (windows of %d%s)\n",
                  (long long) n, s, (double) n / s, T, full ? "" : ", partial model");
     if (full && a.stats && rows > 0)
