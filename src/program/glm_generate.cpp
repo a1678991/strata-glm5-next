@@ -14,6 +14,7 @@
 //   STRATA_GLM_DUMP=<dir>     <dir>/l_out-<l>.glmt: the 4 hyper-connection streams after layer l, one row per token
 //                             (validate/scripts/glmt.py; glm-splice --replace l_out-<l>=<file>)
 //   STRATA_GLM_DUMP_LAYERS=a,b,...   only these layers (default: every layer that runs)
+//   STRATA_GLM_DUMP_FROM=P    only the rows of positions >= P (the prompt path's too)
 //   STRATA_GLM_LAYERS=N       run layers 0..N-1 only (no head unless N is the whole model): a stage's check
 //   STRATA_GLM_FROM=i, STRATA_GLM_INPUT=<file>   layers i..N-1 only, on the rows of <file> (llama.cpp's l_out-(i-1))
 //   STRATA_GLM_KV=f16         the DSA latent in f16 (the parity layout) instead of int8

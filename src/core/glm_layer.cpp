@@ -543,10 +543,15 @@ bool GlmEngine::run(int T, const int32_t* tokens, int64_t pos0, std::string& err
         if (prof_) cudaEventRecord((cudaEvent_t) ev_[(size_t) l], st);
         if (!layer(l, T, err)) return false;
         if (GlmtWriter* w = dump_[(size_t) l]) {
-            const size_t n = (size_t) T * g_.hc * g_.n_embd;
-            cudaMemcpyAsync(h_dump_, x_, n * 4, cudaMemcpyDeviceToHost, st);
-            if (!cuda_ok(cudaStreamSynchronize(st), "dump", err)) return false;
-            if (!w->append(h_dump_, T)) { err = "glm: writing the l_out dump failed"; return false; }
+            // STRATA_GLM_DUMP_FROM=P: only the rows of positions >= P
+            static const int64_t dump_from = std::getenv("STRATA_GLM_DUMP_FROM") ? std::atoll(std::getenv("STRATA_GLM_DUMP_FROM")) : 0;
+            const int64_t skip = std::min<int64_t>(T, std::max<int64_t>(0, dump_from - pos0));
+            const size_t row = (size_t) g_.hc * g_.n_embd, n = (size_t) (T - skip) * row;
+            if (n > 0) {
+                cudaMemcpyAsync(h_dump_, x_ + (size_t) skip * row, n * 4, cudaMemcpyDeviceToHost, st);
+                if (!cuda_ok(cudaStreamSynchronize(st), "dump", err)) return false;
+                if (!w->append(h_dump_, T - skip)) { err = "glm: writing the l_out dump failed"; return false; }
+            }
         }
     }
     if (prof_) cudaEventRecord((cudaEvent_t) ev_[(size_t) n_run_], st);

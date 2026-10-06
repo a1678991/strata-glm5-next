@@ -597,12 +597,19 @@ struct GlmPrefill::Impl {
         tm.mark(kMhc, st);
         sk::mhc_post(b.f, b.x, b.post, b.comb, b.x, v.mshape, (int) T, st);
         if (sc::GlmtWriter* wr = dump[(size_t) l]) {
-            const size_t n = (size_t) T * d.HC * d.E;
-            h_dump.resize(n);
-            if (!cuda_ok(cudaMemcpyAsync(h_dump.data(), b.x, n * 4, cudaMemcpyDeviceToHost, st), "dump", err) ||
-                !cuda_ok(cudaStreamSynchronize(st), "dump", err))
-                return false;
-            if (!wr->append(h_dump.data(), T)) { err = "glm prefill: writing a dump"; return false; }
+            // STRATA_GLM_DUMP_FROM=P (as the windows): only the rows of positions >= P
+            static const int64_t dump_from =
+                std::getenv("STRATA_GLM_DUMP_FROM") ? std::atoll(std::getenv("STRATA_GLM_DUMP_FROM")) : 0;
+            const int64_t skip = std::min<int64_t>(T, std::max<int64_t>(0, dump_from - p0));
+            const size_t row = (size_t) d.HC * d.E, n = (size_t) (T - skip) * row;
+            if (n > 0) {
+                h_dump.resize(n);
+                if (!cuda_ok(cudaMemcpyAsync(h_dump.data(), b.x + (size_t) skip * row, n * 4, cudaMemcpyDeviceToHost, st),
+                             "dump", err) ||
+                    !cuda_ok(cudaStreamSynchronize(st), "dump", err))
+                    return false;
+                if (!wr->append(h_dump.data(), T - skip)) { err = "glm prefill: writing a dump"; return false; }
+            }
         }
         return true;
     }
