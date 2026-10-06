@@ -4,9 +4,11 @@
 // (src/llama-graph.cpp ~2200-2370: mul_mat_id gate and up, ggml_swiglu_clamp(gate, up, swiglu_clamp_exp),
 // mul_mat_id down, times the routing weights, summed over the k slots), on random inputs.
 //
-// Cases: GLM-5.3-Flash's three expert formats - gate/up IQ3_S with down IQ4_XS (39 layers), IQ3_S / Q6_K (layers 12
-// and 44), IQ4_XS / Q6_K (layer 11) - at n_embd 4096 (the real width; the kernels read n_ff from the layout) with
-// n_ff 512 (and 2048, the real one, for the first format), 8 experts, top-4 per token, 160 tokens, weights quantized
+// Cases: GLM-5.3-Flash UD-IQ4_XS's three expert formats - gate/up IQ3_S with down IQ4_XS (39 layers), IQ3_S / Q6_K
+// (layers 12 and 44), IQ4_XS / Q6_K (layer 11) - at n_embd 4096 (the real width; the kernels read n_ff from the
+// layout) with n_ff 512 (and 2048, the real one, for the first format), and UD-IQ3_XXS's two new ones at 4096 x 2048:
+// IQ2_S / IQ3_S (39 layers, IQ3_S down rows) and IQ2_S / IQ4_XS (layers 12, 44; its layer 11 is IQ3_S / IQ4_XS); each
+// also through native_expert_supported, the format gate GlmPrefill applies to every layer at startup; 8 experts, top-4 per token, 160 tokens, weights quantized
 // by ggml's own quantizer into GGUF blocks laid out as Strata's native blob (gate rows | up rows | down rows).
 // Activations and weights are scaled so that about 1-2% of the gate and up pre-activations pass the clamp limit 10.
 // Three results: the GPU's, the oracle's, and an exact one (float64 over the weights as f1cee99's ggml dequantizes
@@ -208,6 +210,10 @@ std::vector<float> gpu(const Case& c, const Weights& w, const Routing& r, const 
 bool run_case(const Case& c, unsigned seed, cudaStream_t st, bool control) {
     std::mt19937 rng(seed);
     std::printf("[moe] %s, n_ff %d, %d experts, top-%d, %d tokens, seed %u\n", c.name, c.nff, NEXP, KUSED, T, seed);
+    if (!k::native_expert_supported(c.gu, c.d, E, c.nff)) {   // GlmPrefill's per-layer format check
+        std::printf("  native_expert_supported: false  FAIL\n");
+        return false;
+    }
     const Weights w = make_weights(c, rng);
     const Routing r = make_routing(rng);
     const std::vector<float> x = normal(rng, (size_t) T * E, 1.0f);
@@ -268,7 +274,9 @@ int main() {
     const Case cases[] = {{GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, 512, "IQ3_S / IQ4_XS"},
                           {GGML_TYPE_IQ3_S, GGML_TYPE_Q6_K, 512, "IQ3_S / Q6_K"},
                           {GGML_TYPE_IQ4_XS, GGML_TYPE_Q6_K, 512, "IQ4_XS / Q6_K"},
-                          {GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, 2048, "IQ3_S / IQ4_XS"}};
+                          {GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, 2048, "IQ3_S / IQ4_XS"},
+                          {GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_S, 2048, "IQ2_S / IQ3_S (UD-IQ3_XXS)"},
+                          {GGML_TYPE_IQ2_S, GGML_TYPE_IQ4_XS, 2048, "IQ2_S / IQ4_XS (UD-IQ3_XXS)"}};
     bool ok = true;
     unsigned seed = 1;
     for (const Case& c : cases) {

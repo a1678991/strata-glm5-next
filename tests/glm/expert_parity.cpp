@@ -1,21 +1,25 @@
 // tests/glm/expert_parity.cpp - GLM-5.3-Flash's routed-expert changes: the clamped SwiGLU epilogue
-// (NativeExpertLayout::swiglu_limit on the GPU, native_gu_rows_clamp on the CPU pool) and Q6_K down rows
-// (native_expert_grouped, iq_dequant_f32; the CPU pool through ggml-cpu's vec_dot).
+// (NativeExpertLayout::swiglu_limit on the GPU, native_gu_rows_clamp on the CPU pool), Q6_K and IQ3_S down rows
+// (native_expert_grouped, iq_dequant_f32; the CPU pool through ggml-cpu's vec_dot) and the Q6_K embedding rows.
 //
-// Formats and shapes of the GGUF: IQ3_S/IQ4_XS (39 layers), IQ3_S/Q6_K (layers 12, 44), IQ4_XS/Q6_K (layer 11), all
-// 4096 x 2048, plus Qwen's IQ3_S/IQ4_NL at 2560 x 640 with the clamp on.  Random weights quantized by ggml's quantizer
-// (Strata's pinned ggml, whose Q6_K quantize/dequantize/vec_dot are those of f1cee99: ggml-quants.c differs between the
-// two only in quantize_iq1_s, ggml-cpu's x86 quants not at all), scaled so that ~30% of the gate/up values pass +-10.
+// Formats and shapes of the GGUFs, all 4096 x 2048: UD-IQ4_XS's IQ3_S/IQ4_XS (39 layers), IQ3_S/Q6_K (layers 12, 44),
+// IQ4_XS/Q6_K (layer 11); UD-IQ3_XXS's IQ2_S/IQ3_S (39 layers: IQ3_S as a down projection), IQ2_S/IQ4_XS (layers 12,
+// 44) and IQ3_S/IQ4_XS (layer 11, the first case); plus Qwen's IQ3_S/IQ4_NL at 2560 x 640 with the clamp on.
+// Random weights quantized by ggml's quantizer (Strata's pinned ggml, whose Q6_K / IQ2_S / IQ3_S / IQ4_XS
+// quantize/dequantize/vec_dot are those of f1cee99: ggml-quants.c differs between the two only in quantize_iq1_s,
+// ggml-cpu's x86 quants not at all), scaled so that ~30% of the gate/up values pass +-10.
 // Six experts, four tokens, 1..4 tokens per expert.
 //
 // Oracles and tolerances (of max |ref|):
 //   GPU gate/up        double sum of ggml's dequantized weights x the q8_1 activation the GPU used     1e-5
+//                      (IQ2_S: llama.cpp CUDA's own integer-truncating formula, emulated; see iq2s_cuda_dot)
 //   GPU h (V1 kernels) swiglu_clamped(g, u, 10) on the GPU's own g, u (std::exp vs __expf)          1e-6
 //   GPU down           double sum of ggml's dequantized down rows x the GPU's own q8_1 h            1e-5
-//   GPU Q6_K dequant   ggml's dequantize_row_q6_K                                                    bitwise
+//   GPU dequant        ggml's dequantize_row_q6_K / _iq3_s (the prompt path's Q6_K, IQ3_S down rows)  bitwise
+//   GPU embedding rows ggml's dequantize_row_q6_K (iq_embed_rows: UD-IQ3_XXS's Q6_K token_embd)      bitwise
 //   CPU ff, 1 token    ggml's vec_dot (the path's own dots) + swiglu_clamped                          bitwise
 //   CPU ff, 2-4 tokens the same reference (the multi-token AVX kernels round on their own, #152)     1e-6
-//   CPU Q6_K down      double sum of ggml's dequantized rows x the dequantized Q8_K h                1e-5
+//   CPU down rows      double sum of ggml's dequantized rows x the dequantized Q8_K h                1e-5
 // and BITWISE: swiglu_limit 1e30 (the clamp branch taken, never binding) equals swiglu_limit 0 on every path, the
 // default GPU kernels equal the V1 ones with the clamp on, and the clamp changes the output (it is active).
 // (Qwen's own bit-identity against the base tree is tests/glm/expert_dump.cpp's.)
@@ -71,6 +75,48 @@ std::vector<float> dequant_q8_1(const uint8_t* q, int64_t n) {
         for (int i = 0; i < 32; ++i) f[(size_t) (b * 32 + i)] = d * (float) (int8_t) blk[4 + i];
     }
     return f;
+}
+
+// llama.cpp CUDA's vec_dot_iq2_s_q8_1 (ggml-cuda/vecdotq.cuh 1124-1167 at f1cee99; iq_kernels.cu transcribes it) applies
+// IQ2_S's scale (ls + 1/2) / 4 to the integer sums of each 32 values with two truncating divisions:
+//   sumi = (s0 * ls0 + s1 * ls1 + (s0 + s1) / 2) / 4,   result = (d_w * d_x) * sumi
+// (s0, s1 the dp4a sums of values 0-15 and 16-31).  ggml-cpu and the f64 reference use the exact scale, so the GPU's
+// IQ2_S gate/up rows differ from them by up to 1.125 |d_w d_x| per 32 values (~3e-5 of max |ref| here).  This is the
+// same formula on the host: the signed grid values come back exactly from ggml's dequantized weights (y / db, small
+// integers), the activations are the GPU's own q8_1 codes.  Per output row: the emulated value (the float
+// products summed in double), the truncation bound sum 1.125 |d_w d_x| over its blocks, and sum |term| (the scale of
+// the GPU's float rounding: 128 terms summed in float, allowed 1e-5 of it).
+struct Iq2sRow { double v, bound, mag; };
+Iq2sRow iq2s_cuda_dot(const uint8_t* blocks, const float* wdq, const uint8_t* xq, int64_t n) {
+    Iq2sRow r{0, 0, 0};
+    for (int64_t b = 0; b < n / 256; ++b) {
+        const uint8_t* blk = blocks + b * 82;   // block_iq2_s: d (fp16), qs[64], qh[8], scales[8]
+        ggml_fp16_t dh;
+        std::memcpy(&dh, blk, 2);
+        const float d = ggml_fp16_to_fp32(dh);
+        for (int ib = 0; ib < 8; ++ib) {
+            const uint8_t* xb = xq + (b * 8 + ib) * 36;   // q8_1: half2 {d, sum}, 32 x int8
+            ggml_fp16_t xh;
+            std::memcpy(&xh, xb, 2);
+            const float dx = ggml_fp16_to_fp32(xh);
+            const int ls[2] = {blk[74 + ib] & 0x0F, blk[74 + ib] >> 4};
+            int sh[2] = {0, 0};
+            for (int h = 0; h < 2; ++h) {
+                const float db = d * (0.5f + (float) ls[h]) * 0.25f;   // dequantize_row_iq2_s's scale
+                for (int j = 0; j < 16; ++j) {
+                    const int64_t k = b * 256 + ib * 32 + h * 16 + j;
+                    const int g = db != 0.f ? (int) std::lround(wdq[k] / db) : 0;
+                    sh[h] += g * (int) (int8_t) xb[4 + h * 16 + j];
+                }
+            }
+            const int sumi = (sh[0] * ls[0] + sh[1] * ls[1] + (sh[0] + sh[1]) / 2) / 4;
+            const float dd = d * dx;
+            r.v += (double) (dd * (float) sumi);
+            r.mag += std::fabs((double) (dd * (float) sumi));
+            r.bound += 1.125 * std::fabs((double) dd);
+        }
+    }
+    return r;
 }
 
 struct Expert {
@@ -159,6 +205,9 @@ bool gpu_checks(const Expert& X, cudaStream_t st) {
     const auto xd = dequant_q8_1(on.xq.data(), (int64_t) T * X.H);
     const auto hd = dequant_q8_1(on.hq.data(), (int64_t) on.out.size() / X.H * X.FF);
     std::vector<float> g_ref(on.gate.size()), u_ref(on.up.size()), o_ref(on.out.size());
+    const bool iq2s = X.gu == 22;   // the llama.cpp CUDA formula above, and its distance to the exact one
+    std::vector<float> g_emu(iq2s ? on.gate.size() : 0), u_emu(iq2s ? on.up.size() : 0);
+    double trunc_excess = -1e30;    // max over rows of |gpu - exact| - (bound + 1e-5 sum|term|), must stay <= 0
     int ent = 0;
     for (int e = 0; e < E; ++e) {
         const uint8_t* blob = X.blobs.data() + (size_t) e * X.L.bytes;
@@ -174,6 +223,17 @@ bool gpu_checks(const Expert& X, cudaStream_t st) {
                 }
                 g_ref[(size_t) (ent * X.FF + r)] = (float) sg;
                 u_ref[(size_t) (ent * X.FF + r)] = (float) su;
+                if (iq2s) {
+                    const uint8_t* xq = on.xq.data() + (size_t) t * (X.H / 32) * 36;
+                    const Iq2sRow eg = iq2s_cuda_dot(blob + (size_t) r * X.L.gu_row, wg.data() + r * X.H, xq, X.H);
+                    const Iq2sRow eu = iq2s_cuda_dot(blob + X.L.up_off + (size_t) r * X.L.gu_row, wu.data() + r * X.H,
+                                                     xq, X.H);
+                    const size_t i = (size_t) (ent * X.FF + r);
+                    g_emu[i] = (float) eg.v;
+                    u_emu[i] = (float) eu.v;
+                    trunc_excess = std::max({trunc_excess, std::fabs(on.gate[i] - sg) - eg.bound - 1e-5 * eg.mag,
+                                             std::fabs(on.up[i] - su) - eu.bound - 1e-5 * eu.mag});
+                }
             }
             const float* ht = hd.data() + (size_t) ent * X.FF;
             for (int64_t r = 0; r < X.H; ++r) {
@@ -184,17 +244,46 @@ bool gpu_checks(const Expert& X, cudaStream_t st) {
             ++ent;
         }
     }
-    ok &= report("GPU gate (vs f64 dot)", compare(on.gate.data(), g_ref.data(), g_ref.size()), 1e-5);
-    ok &= report("GPU up (vs f64 dot)", compare(on.up.data(), u_ref.data(), u_ref.size()), 1e-5);
+    if (iq2s) {
+        ok &= report("GPU gate (vs llama.cpp CUDA's IQ2_S)", compare(on.gate.data(), g_emu.data(), g_emu.size()), 1e-5);
+        ok &= report("GPU up (vs llama.cpp CUDA's IQ2_S)", compare(on.up.data(), u_emu.data(), u_emu.size()), 1e-5);
+        const Err eg = compare(on.gate.data(), g_ref.data(), g_ref.size());
+        const Err eu = compare(on.up.data(), u_ref.data(), u_ref.size());
+        std::printf("  %-34s rel %.3e / %.3e (gate / up; llama.cpp CUDA's integer truncation)\n",
+                    "  the same vs the exact f64 dot", eg.rel(), eu.rel());
+        const bool within = trunc_excess <= 0.0;
+        std::printf("  %-34s every row within its truncation bound (worst excess %.3e)  %s\n",
+                    "  ... and its bound", trunc_excess, within ? "PASS" : "FAIL");
+        ok &= within;
+    } else {
+        ok &= report("GPU gate (vs f64 dot)", compare(on.gate.data(), g_ref.data(), g_ref.size()), 1e-5);
+        ok &= report("GPU up (vs f64 dot)", compare(on.up.data(), u_ref.data(), u_ref.size()), 1e-5);
+    }
     ok &= report("GPU down (vs f64 dot on its q8_1 h)", compare(on.out.data(), o_ref.data(), o_ref.size()), 1e-5);
-    if (X.dn == 14) {   // the prompt path's dequantizer for the Q6_K rows
+    if (X.dn == 14 || X.dn == 21) {   // the prompt path's dequantizer for the Q6_K / IQ3_S down rows
         const uint8_t* down0 = X.blobs.data() + X.L.down_off;
-        const auto ref = dequant(14, down0, X.H * X.FF);
+        const auto ref = dequant(X.dn, down0, X.H * X.FF);
         Dev<uint8_t> dw(std::vector<uint8_t>(down0, down0 + (size_t) X.H * X.L.d_row));
         Dev<float> out((size_t) (X.H * X.FF));
-        k::iq_dequant_f32(14, dw.p, X.H * X.FF, out.p, st);
+        k::iq_dequant_f32(X.dn, dw.p, X.H * X.FF, out.p, st);
         GLM_CHECK(cudaStreamSynchronize(st));
-        ok &= bitwise("GPU Q6_K dequant == ggml's", out.down().data(), ref.data(), ref.size());
+        ok &= bitwise(X.dn == 14 ? "GPU Q6_K dequant == ggml's" : "GPU IQ3_S dequant == ggml's", out.down().data(),
+                      ref.data(), ref.size());
+        if (X.dn == 14) {
+            // UD-IQ3_XXS's Q6_K token_embd through iq_embed_rows (the down matrix as a table of H rows of FF values),
+            // and the gate: Q6_K only for glm5-next (glm_embed_type_supported), a Qwen file as before
+            const std::vector<int32_t> ids = {0, 7, (int32_t) X.H - 1, 1234, 7};
+            Dev<int32_t> dids(ids);
+            Dev<float> rows(ids.size() * (size_t) X.FF);
+            k::iq_embed_rows(14, dw.p, X.L.d_row, dids.p, (int64_t) ids.size(), X.FF, rows.p, st);
+            GLM_CHECK(cudaStreamSynchronize(st));
+            std::vector<float> want;
+            for (int32_t id : ids) want.insert(want.end(), ref.begin() + (size_t) id * X.FF, ref.begin() + (size_t) (id + 1) * X.FF);
+            ok &= bitwise("GPU Q6_K embedding rows == ggml's", rows.down().data(), want.data(), want.size());
+            const bool gate = k::glm_embed_type_supported(14) && !k::embed_type_supported(14);
+            std::printf("  %-34s %s\n", "Q6_K embedding: glm5-next only", gate ? "PASS" : "FAIL");
+            ok &= gate;
+        }
     }
     return ok;
 }
@@ -262,7 +351,7 @@ bool cpu_checks(const Expert& X) {
             }
             moved |= std::memcmp(ff0[(size_t) j].data(), ff10[(size_t) j].data(), (size_t) X.FF * 4) != 0;
         }
-        // down rows (Q6_K: ggml-cpu's vec_dot against Q8_K) on the clamped h
+        // down rows (Q6_K, IQ3_S, IQ4_XS: ggml-cpu's vec_dot against Q8_K) on the clamped h
         std::vector<std::vector<uint8_t>> hq((size_t) nt, std::vector<uint8_t>(f.h_bytes));
         std::vector<const void*> hp;
         std::vector<std::vector<float>> o((size_t) nt, std::vector<float>((size_t) X.H));
@@ -302,9 +391,11 @@ int main() {
     GLM_CHECK(cudaStreamCreate(&st));
     ggml_cpu_init();
     struct Cfg { int gu, dn; int64_t H, FF; const char* what; };
-    const Cfg cfgs[] = {{21, 23, 4096, 2048, "IQ3_S / IQ4_XS (GLM, 39 layers)"},
-                        {21, 14, 4096, 2048, "IQ3_S / Q6_K (GLM layers 12, 44)"},
-                        {23, 14, 4096, 2048, "IQ4_XS / Q6_K (GLM layer 11)"},
+    const Cfg cfgs[] = {{21, 23, 4096, 2048, "IQ3_S / IQ4_XS (UD-IQ4_XS 39 layers; UD-IQ3_XXS layer 11)"},
+                        {21, 14, 4096, 2048, "IQ3_S / Q6_K (UD-IQ4_XS layers 12, 44)"},
+                        {23, 14, 4096, 2048, "IQ4_XS / Q6_K (UD-IQ4_XS layer 11)"},
+                        {22, 21, 4096, 2048, "IQ2_S / IQ3_S (UD-IQ3_XXS, 39 layers)"},
+                        {22, 23, 4096, 2048, "IQ2_S / IQ4_XS (UD-IQ3_XXS layers 12, 44)"},
                         {21, 20, 2560, 640, "IQ3_S / IQ4_NL (Qwen's format, clamp on)"}};
     bool ok = true;
     unsigned seed = 100;

@@ -67,6 +67,9 @@ bool GlmFetch::init(const ModelGeometry& g, ExpertCache* cache, FileExpertSource
     slots_.reset(new Slot[(size_t) n_slots_]);
     look_ = std::max(0, std::min(2, env_int("STRATA_GLM_LOOKAHEAD", 1)));
     kp_ = std::max(1, std::min(std::min(32, (int) g.n_expert), env_int("STRATA_GLM_LOOKAHEAD_K", k_)));
+    // off by default: on the 9070 XT (7 GB/s host-to-device) it cut the end-of-layer GPU wait 30.1 -> 25.4 s but
+    // moved 10% more bytes over PCIe (the unused predictions) and lost 1% of tok/s; an A/B arm for faster links
+    n_pre_ = look_ == 1 ? std::max(0, std::min(64, env_int("STRATA_GLM_PRESTAGE", 0))) : 0;
     pred_.assign((size_t) g.n_layers, {});
     prev_.assign((size_t) g.n_layers, {});
     if (look_ != 0) {
@@ -87,11 +90,12 @@ bool GlmFetch::init(const ModelGeometry& g, ExpertCache* cache, FileExpertSource
     active_ = true;
     const auto& ro = src->reader_options();
     std::fprintf(stderr, "strata generate: glm5-next: file tier: %d reader threads, parts of %.2f MiB, %s reads; %d host "
-                         "slots (%.2f GiB at most); lookahead %s (top-%d of the next layer's router)%s\n",
+                         "slots (%.2f GiB at most); lookahead %s (top-%d of the next layer's router), %d VRAM slots for "
+                         "its blobs%s\n",
                  ro.threads, (double) ro.part_bytes / 1048576.0,
                  ro.io == FileExpertSource::ReadIo::Direct ? "O_DIRECT" : ro.io == FileExpertSource::ReadIo::Pread ? "pread" : "mmap",
                  n_slots_, (double) n_slots_ * (double) blob_bytes_ / 1073741824.0,
-                 look_ == 0 ? "off" : look_ == 1 ? "on" : "predicting only", kp_,
+                 look_ == 0 ? "off" : look_ == 1 ? "on" : "predicting only", kp_, n_pre_,
                  cold_ ? "; STRATA_FILE_COLD: no blob served twice from a slot" : "");
     return true;
 }
@@ -317,18 +321,34 @@ void GlmFetch::end() {
     // the layer's copies have landed: its slots are evictable from the next call on (pin_call < call_)
 }
 
+int GlmFetch::landed_for_next(Ready* out, int max) {
+    int n = 0;
+    for (int s : spec_slots_) {
+        if (n >= max) break;
+        Slot& x = slots_[s];
+        if (x.spec_call != call_ + 1 || x.key < 0) continue;
+        if (x.reading) {
+            if (!src_->read_done(x.t)) continue;
+            x.reading = false;
+        }
+        if (x.t.failed.load()) continue;
+        out[n++] = Ready{x.key / g_.n_expert, (int32_t) (x.key % g_.n_expert), x.host};
+    }
+    return n;
+}
+
 std::string GlmFetch::stats_line() const {
     if (!active_) return "glm fetch: off (the old path: one blob at a time through FileExpertSource::blob)";
     const auto r = src_->reader_stats();
     const auto& ro = src_->reader_options();
     auto pct = [](int64_t a, int64_t b) { return b > 0 ? 100.0 * (double) a / (double) b : 0.0; };
-    char b[1536];
+    char b[1792];
     std::snprintf(
         b, sizeof b,
         "glm fetch: reader %d threads x %.1f MiB parts (%s): %lld blobs, %.1f MB in %.1f ms busy = %.2f GB/s (%.1f ms "
         "of part reads summed over threads); the engine waited %.1f ms; %lld file-tier experts: %lld kept in a slot "
         "from an earlier call, %lld urgent reads (%lld promoted from the lookahead); lookahead: %lld reads, %lld used, "
-        "%lld dropped unread, %lld read unused; predicted sets vs each call's experts (every tier): next-layer router "
+        "%lld dropped unread, %lld read unused; copied into VRAM ahead: %lld used, %lld not; predicted sets vs each call's experts (every tier): next-layer router "
         "%lld/%lld = %.1f%% (%.1f per call, %lld calls), previous token %lld/%lld = %.1f%% (%.1f per call); file-tier misses "
         "in those calls: next-layer router %lld/%lld = %.1f%%, previous token %lld/%lld = %.1f%%",
         ro.threads, (double) ro.part_bytes / 1048576.0,
@@ -336,7 +356,7 @@ std::string GlmFetch::stats_line() const {
         (long long) r.blobs, (double) r.bytes / 1e6, r.busy_ms, r.busy_ms > 0 ? (double) r.bytes / 1e6 / r.busy_ms : 0.0,
         r.part_ms, st_.ms_wait, (long long) st_.file, (long long) st_.slot_hits, (long long) st_.urgent,
         (long long) st_.promoted, (long long) st_.spec, (long long) st_.spec_used, (long long) st_.spec_cancelled,
-        (long long) st_.spec_unused, (long long) st_.pred_hit, (long long) st_.pred_actual,
+        (long long) st_.spec_unused, (long long) st_.pre_used, (long long) st_.pre_unused, (long long) st_.pred_hit, (long long) st_.pred_actual,
         pct(st_.pred_hit, st_.pred_actual), st_.pred_calls ? (double) st_.pred_size / (double) st_.pred_calls : 0.0,
         (long long) st_.pred_calls, (long long) st_.prev_hit, (long long) st_.prev_actual,
         pct(st_.prev_hit, st_.prev_actual), st_.prev_calls ? (double) st_.prev_size / (double) st_.prev_calls : 0.0,

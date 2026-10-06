@@ -17,6 +17,10 @@
 //      architecture, type and shape checks and stop at the (absent) payload; NativeDense serves GLM's dense FFN.
 //   5. Native expert formats at GLM's widths (4096 / 2048): blob sizes of the three format pairs of the file and a
 //      45-layer native_experts.txt with three dense layers (STRATA_NATIVE_EXPERTS builds).
+//   6. GLM-5.3-Flash UD-IQ3_XXS (glm-iq3, read on 2026-10-07): 4 shards (split keys, which shard holds which tensor,
+//      a shard with a wrong split.no refused), the same geometry as UD-IQ4_XS, every tensor checked, the per-layer
+//      expert formats (IQ2_S / IQ3_S, IQ2_S / IQ4_XS at 12 and 44, IQ3_S / IQ4_XS at 11) with GPU kernels and the
+//      prompt path's dequantizer, 109,867,696,128 B of experts; the loaders as in 4 with a Q6_K token_embd.
 #include "gguf_fixture.hpp"
 
 #include "strata/artifact/gguf_reader.hpp"
@@ -27,6 +31,7 @@
 #include "strata/core/native_head.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
+#include "strata/kernels/iq_kernels.hpp"
 
 #include <array>
 #include <cstring>
@@ -191,6 +196,83 @@ void glm(const fs::path& root) {
     std::fputs(text.c_str(), stdout);
 }
 
+/// GLM-5.3-Flash UD-IQ3_XXS: the same model as UD-IQ4_XS in a smaller quant, split in 4 (shard 1 metadata only)
+void glm_iq3(const fs::path& root) {
+    std::printf("glm5-next UD-IQ3_XXS (4 shards)\n");
+    const fs::path dir = root / "glm-iq3";
+    const std::vector<std::string> shards = shards_of(dir);
+    check(shards.size() == 4 && shards[0].ends_with("GLM-5.3-Flash-UD-IQ3_XXS-00001-of-00004.gguf") &&
+              shards[3].ends_with("-00004-of-00004.gguf"),
+          "the split names resolve to 4 shards, the metadata shard first");
+    const strata::GgufModel m(shards);
+    bool keys = true;
+    std::array<size_t, 4> per{};
+    for (size_t i = 0; i < m.size() && i < 4; ++i) {
+        const strata::MetaValue* c = m.shard(i).get("split.count");
+        const strata::MetaValue* n = m.shard(i).get("split.no");
+        const strata::MetaValue* t = m.shard(i).get("split.tensors.count");
+        keys = keys && c && n && t && c->u == 4 && n->u == i && t->u == 1412;
+        per[i] = m.shard(i).tensors().size();
+    }
+    check(keys && per == std::array<size_t, 4>{0, 614, 558, 240} && m.meta().get("general.architecture") &&
+              m.shard(1).get("general.architecture") == nullptr,
+          "split.count 4, split.no 0-3, split.tensors.count 1412 in every shard; tensors 0 / 614 / 558 / 240; "
+          "the metadata in shard 1 only");
+    // where the tensors are: output and token_embd in shard 2; layer l's three expert tensors in one shard, 2 for
+    // layers 3-19, 3 for 20-37, 4 for 38-45 (blocks 20 and 38 straddle a boundary: their other tensors start earlier)
+    auto shard_of = [&](const std::string& name) {
+        size_t at = 99;
+        return m.find(name, &at) ? (int) at : -1;
+    };
+    bool where = shard_of("output.weight") == 1 && shard_of("token_embd.weight") == 1 &&
+                 shard_of("blk.20.attn_norm.weight") == 1 && shard_of("blk.38.attn_norm.weight") == 2;
+    const char* roles[3] = {"gate", "up", "down"};
+    for (int l = 3; l <= 45; ++l)
+        for (const char* r : roles)
+            where = where && shard_of("blk." + std::to_string(l) + ".ffn_" + r + "_exps.weight") ==
+                                 (l < 20 ? 1 : l < 38 ? 2 : 3);
+    check(where, "output / token_embd in shard 2; experts of layers 3-19 in shard 2, 20-37 in 3, 38-45 in 4");
+    ModelGeometry g, g4;
+    std::string err, err4;
+    const bool read = geometry(dir, g, err) && geometry(root / "glm", g4, err4);
+    check(read && strata::core::describe_geometry(g, "x: ") == strata::core::describe_geometry(g4, "x: ") &&
+              g.n_layers == 45 && g.n_expert == 288 && g.n_ff == 2048 && g.n_dense_lead == 3,
+          "geometry_from_gguf: the UD-IQ4_XS geometry, line for line" + (err.empty() ? std::string() : ": " + err));
+    int64_t checked = 0;
+    const bool ok = tensors_ok(dir, g, err, &checked);
+    check(ok && checked == 1412, "check_all_gguf: " + std::to_string(checked) + " of 1412 tensors" +
+                                     (err.empty() ? std::string() : ": " + err));
+    // the expert formats per layer, and the trunk's expert bytes (blk.45, the MTP block, is left out by the pack)
+    constexpr uint32_t IQ3_S = 21, IQ2_S = 22, IQ4_XS = 23, Q2_K = 10, Q3_K = 11;
+    bool fmts = true, kernels = true;
+    uint64_t total = 0;
+    for (int l = 3; l <= 45; ++l) {
+        const auto* gt = m.find("blk." + std::to_string(l) + ".ffn_gate_exps.weight");
+        const auto* ut = m.find("blk." + std::to_string(l) + ".ffn_up_exps.weight");
+        const auto* dt = m.find("blk." + std::to_string(l) + ".ffn_down_exps.weight");
+        if (!gt || !ut || !dt) { fmts = false; continue; }
+        const uint32_t wg = l == 45 ? Q2_K : l == 11 ? IQ3_S : IQ2_S;
+        const uint32_t wd = l == 45 ? Q3_K : (l == 11 || l == 12 || l == 44) ? IQ4_XS : IQ3_S;
+        fmts = fmts && (uint32_t) gt->type == wg && (uint32_t) ut->type == wg && (uint32_t) dt->type == wd;
+        if (l == 45) continue;
+        total += strata::tensor_payload_bytes(*gt) + strata::tensor_payload_bytes(*ut) + strata::tensor_payload_bytes(*dt);
+#if defined(STRATA_NATIVE_EXPERTS)
+        kernels = kernels && strata::kernels::native_expert_supported((int) gt->type, (int) dt->type, g.n_embd, g.n_ff);
+#endif
+    }
+    check(fmts, "experts: IQ2_S/IQ2_S/IQ3_S in 39 layers, IQ2_S/IQ2_S/IQ4_XS at 12 and 44, IQ3_S/IQ3_S/IQ4_XS at 11 "
+                "(MTP 45: Q2_K/Q2_K/Q3_K)");
+#if defined(STRATA_NATIVE_EXPERTS)
+    check(kernels, "native_expert_supported (GPU grouped kernels + the prompt path's FP16 dequantizer) for every layer");
+#endif
+    check(total == 109867696128ull, "the trunk's experts (layers 3-44): " + std::to_string(total) +
+                                        " B = 109,867,696,128 (102.32 GiB)");
+    // a shard that declares another place in the split
+    const bool refused = !geometry(root / "glm-iq3-split", g, err) &&
+                         has(err, "does not declare itself shard 3 of 4");
+    check(refused, "a shard with split.no 3 in third place is refused: " + err);
+}
+
 void refusals(const fs::path& root) {
     std::printf("refusals\n");
     ModelGeometry g;
@@ -241,7 +323,8 @@ void refusals(const fs::path& root) {
 
 void loaders(const fs::path& root) {
     std::printf("native loaders (headers only: every check before the payload)\n");
-    for (const char* name : {"glm", "qwen"}) {
+    std::set<std::string> served_glm;
+    for (const char* name : {"glm", "qwen", "glm-iq3"}) {
         ModelGeometry g;
         std::string err;
         geometry(root / name, g, err);
@@ -257,15 +340,20 @@ void loaders(const fs::path& root) {
         {
             strata::core::NativeEmbed embed;
             const bool loaded = embed.load(shards, g.n_embd, g.n_vocab, err);
+            const bool q6 = std::string(name) == "glm-iq3";   // UD-IQ3_XXS: Q6_K (glm_embed_type_supported)
             check(!loaded && has(err, "native embedding: token_embd.weight's payload is truncated"),
-                  std::string(name) + ": NativeEmbed takes token_embd.weight Q8_0 up to the payload");
+                  std::string(name) + ": NativeEmbed takes token_embd.weight " + (q6 ? "Q6_K" : "Q8_0") +
+                      " up to the payload" + (loaded ? std::string() : ": " + err));
         }
         std::set<std::string> served;
         check(strata::core::NativeDense::served_names(shards, false, served, err), std::string(name) + ": served_names");
         int dense = 0;
         for (const auto& n : served)
             dense += n.ends_with(".ffn_gate.weight") || n.ends_with(".ffn_up.weight") || n.ends_with(".ffn_down.weight");
-        if (std::string(name) == "glm")
+        if (std::string(name) == "glm") served_glm = served;
+        if (std::string(name) == "glm-iq3")
+            check(served == served_glm, "glm-iq3: NativeDense serves the same 643 matrices as UD-IQ4_XS (Q8_0 or Q6_K)");
+        else if (std::string(name) == "glm")
             check(served.size() == 643 && dense == 9 && served.count("blk.0.ffn_gate.weight") &&
                       served.count("blk.2.ffn_down.weight") && served.count("blk.3.attn_k_b.weight") &&
                       served.count("blk.0.hc_attn_fn.weight") && !served.count("blk.3.ffn_gate_inp.weight") &&
@@ -355,7 +443,7 @@ void native_experts(const fs::path& tmp) {
 #if defined(STRATA_NATIVE_EXPERTS)
     std::printf("native expert formats at the geometry's widths\n");
     namespace cpu = strata::kernels::cpu;
-    constexpr int IQ3_S = 21, IQ4_XS = 23, Q6_K = 14, IQ4_NL = 20;
+    constexpr int IQ3_S = 21, IQ4_XS = 23, Q6_K = 14, IQ4_NL = 20, IQ2_S = 22;
     struct Pair {
         int gu, d;
         size_t bytes;
@@ -365,6 +453,8 @@ void native_experts(const fs::path& tmp) {
         {IQ3_S, IQ4_XS, 11665408, "GLM IQ3_S/IQ3_S/IQ4_XS (39 layers): 3,604,480 x 2 + 4,456,448"},
         {IQ3_S, Q6_K, 14090240, "GLM IQ3_S/IQ3_S/Q6_K (layers 12, 44)"},
         {IQ4_XS, Q6_K, 15794176, "GLM IQ4_XS/IQ4_XS/Q6_K (layer 11)"},
+        {IQ2_S, IQ3_S, 8978432, "GLM UD-IQ3_XXS IQ2_S/IQ2_S/IQ3_S (39 layers): 2,686,976 x 2 + 3,604,480"},
+        {IQ2_S, IQ4_XS, 9830400, "GLM UD-IQ3_XXS IQ2_S/IQ2_S/IQ4_XS (layers 12, 44)"},
     };
     for (const Pair& p : pairs) {
         cpu::NativeFmt f;
@@ -405,6 +495,24 @@ void native_experts(const fs::path& tmp) {
     const bool wide = cpu::expert_layout_load(tmp.string(), 45, 288, err, 2560, 640, 3);
     const std::string why = err;
     check(!wide, "the same file at Qwen's widths is refused: " + why);
+    // UD-IQ3_XXS's layout (tools/iq_pack.py writes these types and blob sizes from the GGUF)
+    {
+        std::ofstream o(tmp / "native_experts.txt", std::ios::binary);
+        o << "# strata native experts v3: layer gate_up_type down_type offset blob_bytes (n_expert 288)\n";
+        uint64_t off = 0;
+        for (int l = 3; l < 45; ++l) {
+            const int gu = l == 11 ? IQ3_S : IQ2_S, d = (l == 11 || l == 12 || l == 44) ? IQ4_XS : IQ3_S;
+            const uint64_t blob = l == 11 ? 11665408ull : d == IQ4_XS ? 9830400ull : 8978432ull;
+            o << l << " " << gu << " " << d << " " << off << " " << blob << "\n";
+            off += blob * 288;
+        }
+    }
+    err.clear();
+    const bool ok3 = cpu::expert_layout_load(tmp.string(), 45, 288, err, 4096, 2048, 3);
+    check(ok3 && lay.native && lay.bytes[2] == 0 && lay.total == 109867696128ull && lay.max_blob == 11665408 &&
+              lay.fmt[3].gu_type == IQ2_S && lay.fmt[3].d_type == IQ3_S && lay.fmt[12].d_type == IQ4_XS,
+          "UD-IQ3_XXS's 45-layer layout: " + std::to_string(lay.total) + " B = 109,867,696,128" +
+              (err.empty() ? std::string() : " - " + err));
     dense_layers_in_place(tmp / "mini");
     // restore the canonical layout for anything after this
     cpu::expert_layout_load((tmp / "none").string(), 48, 512, err);
@@ -488,6 +596,7 @@ int main(int argc, char** argv) {
     try {
         qwen(root);
         glm(root);
+        glm_iq3(root);
         refusals(root);
         loaders(root);
         native_experts(fs::temp_directory_path() /

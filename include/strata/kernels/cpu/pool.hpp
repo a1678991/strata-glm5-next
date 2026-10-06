@@ -167,7 +167,9 @@ public:
     /// read once for all of its tokens.
     void run_split_multi(ExpertJobMulti* jobs, int n);
     /// Plan v0.3 P6: the same for a native pack's layer (ggml-cpu arithmetic, `nact` activations).
-    void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n);
+    /// `swiglu_limit` > 0: GLM-5.3-Flash's clamped SwiGLU (native_gu_rows_clamp, native_expert_clamp.hpp); 0, the
+    /// default and every Qwen call, is native_gu_rows exactly.  The Q2_0-pack branch has no clamp and refuses one.
+    void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n, float swiglu_limit = 0.0f);
     static constexpr int kMaxSplitMulti = 96;
     /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.
     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;
@@ -280,6 +282,7 @@ private:
         alignas(64) uint8_t hq[MAXT][kNativeHBytes];   // plan v0.3 P6: native down activations
     };
     const NativeFmt* nfmt_ = nullptr;
+    float nlimit_ = 0.0f;   // run_split_multi_native's swiglu_limit (0: no clamp, the Qwen path)
     std::vector<SplitBufMulti> split_multi_;
     PoolAffinity affinity_ = PoolAffinity::All;
     CpuTopology topo_;

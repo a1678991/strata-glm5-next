@@ -25,6 +25,8 @@
 //   STRATA_GLM_FETCH_SLOTS=N     host slots (default 256, at least 2 x window x k + 16), page-locked, allocated on use
 //   STRATA_GLM_LOOKAHEAD=0|1|2   off / predict and read (default) / predict and count only
 //   STRATA_GLM_LOOKAHEAD_K=K     experts predicted per token (default the model's k; at most 32)
+//   STRATA_GLM_PRESTAGE=N        lookahead blobs already read when a layer ends are copied into N VRAM slots (at
+//                                most 64) while the next layer's attention runs (default 0 = off; see glm_fetch.cpp)
 #pragma once
 
 #include "strata/core/expert_source.hpp"
@@ -54,6 +56,7 @@ public:
         int64_t spec_cancelled = 0;   ///< ... dropped before any part was read
         int64_t spec_unused = 0;      ///< ... read (or reading) but not needed by their layer
         double ms_wait = 0;           ///< the engine's time blocked on reads
+        int64_t pre_used = 0, pre_unused = 0;   ///< lookahead blobs copied into VRAM ahead: needed / not
         // the predictors, against each layer call's distinct experts (every tier)
         int64_t pred_calls = 0, pred_actual = 0, pred_size = 0, pred_hit = 0;
         int64_t prev_calls = 0, prev_actual = 0, prev_size = 0, prev_hit = 0;
@@ -87,6 +90,15 @@ public:
     const uint8_t* wait(int64_t l, int32_t e, std::string& err);
     /// After the copies of the layer's blobs have landed: its slots may be reused.
     void end();
+    /// After `end`: the lookahead's reads for the next call that have already landed (at most `max`), as
+    /// (layer, expert, host bytes); GlmExperts copies them into VRAM while the next layer's attention runs.  The
+    /// host slots stay pinned until that call has ended.
+    struct Ready { int64_t layer; int32_t expert; const uint8_t* host; };
+    int landed_for_next(Ready* out, int max);
+    /// Pre-staged blobs (copied into VRAM ahead) the next call used / did not use, for the stats line.
+    void count_prestaged(int64_t used, int64_t unused) { st_.pre_used += used; st_.pre_unused += unused; }
+    /// Experts copied into VRAM ahead per layer (STRATA_GLM_PRESTAGE, default 0 = off).
+    int prestage_slots() const { return active_ ? n_pre_ : 0; }
 
     const Stats& stats() const { return st_; }
     /// "glm fetch: ..." - the reader's rate, the slots, the lookahead and the predictors.
@@ -113,6 +125,7 @@ private:
     FileExpertSource* src_ = nullptr;
     bool active_ = false, cold_ = false;
     int look_ = 1;
+    int n_pre_ = 0;
     int max_t_ = 0, k_ = 0, kp_ = 0;
     uint64_t blob_bytes_ = 0;
     std::unique_ptr<Slot[]> slots_;
