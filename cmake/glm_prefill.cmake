@@ -15,3 +15,7 @@ target_include_directories(strata_glm_prefill_kernels PUBLIC ${CMAKE_CURRENT_SOU
 target_link_libraries(strata_glm_prefill_kernels PUBLIC strata_dsa_kernels ${_strata_gpu_blas_target}
                       ${_strata_gpu_runtime_target})
 
+if(TARGET strata_prefill)
+  target_sources(strata_prefill PRIVATE src/prefill/glm_prefill.cpp)
+  target_link_libraries(strata_prefill PUBLIC strata_glm_prefill_kernels)
+endif()
