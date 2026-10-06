@@ -24,7 +24,7 @@
 // which moves about one of its 8192 values per token across a Q8 rounding boundary, and one such flip shifts every
 // output by d * w ~ (3/127) * (1/sqrt(8192)) ~ 2.6e-4 - the size of the kda_out error at T = 1.
 //
-// Prints the per-kernel time for one token and for a T = 8 window (median of 100, events).
+// Prints the per-kernel time for one token and for a T = 8 window (median of 100, best of 5 rounds, events).
 #include "strata/kernels/kda_decode.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 
@@ -327,7 +327,7 @@ bool part2(const k::KdaShape& sh, cudaStream_t st, bool timing) {
         ok &= report("y (quantized projections)", compare(yv.data(), y_ref.data(), yv.size()), TOL_Q);
         ok &= report("kda_out = W_o y", compare(ov.data(), out_ref.data(), ov.size()), TOL_Q);
         if (timing && T == 1) {
-            std::printf("  one-token layer cost on this GPU (median of 100):\n");
+            std::printf("  one-token layer cost on this GPU (median of 100, best of 5 rounds):\n");
             std::printf("    quantize x + q|k|v GEMV (4096 -> 24576 Q8_0)  %8.2f us\n", median_us([&] {
                 k::native_quantize_q8_1(dx.p, xq.p, NE, 1, st);
                 k::native_q8_0_mmvq(d_qkv.p, xq.p, qkv_d.p, NE, C, 1, st); }, st));
@@ -351,7 +351,8 @@ void timings(const k::KdaShape& sh, cudaStream_t st) {
     GpuIn g(in);
     Dev<float> hist(in.hist), state(in.state), h((size_t) 8 * C), y((size_t) 8 * DI);
     Dev<int32_t> nk(std::vector<int32_t>{8});
-    std::printf("[timing] median of 100 on this GPU\n");
+    std::printf("[timing] median of 100, best of 5 rounds on this GPU\n");
+    std::printf("    (floor: a 4-byte memset launch takes %.2f us here)\n", floor_us(st));
     std::printf("  kda_conv_l2      1 token  (decode)   %8.2f us\n",
                 median_us([&] { k::kda_conv_l2(hist.p, g.qkv.p, g.wq.p, g.wk.p, g.wv.p, h.p, sh, 1, true, st); }, st));
     std::printf("  kda_step_norm    1 token  (decode)   %8.2f us\n", median_us([&] {

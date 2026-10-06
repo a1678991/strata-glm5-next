@@ -175,7 +175,8 @@ bool run(unsigned seed, int T, const k::MhcShape& sh, cudaStream_t st, bool timi
     ok &= report("cur through the GEMV", compare(g_cur2.data(), r_cur.data(), g_cur2.size()), 1e-3);
 
     if (timing) {
-        std::printf("  [timing] median of 100, T = %d\n", T);
+        std::printf("  [timing] median of 100, best of 5 rounds, T = %d\n", T);
+    std::printf("    (floor: a 4-byte memset launch takes %.2f us here)\n", floor_us(st));
         std::printf("    mhc_flat_norm                       %8.2f us\n",
                     median_us([&] { k::mhc_flat_norm(dx.p, dflat.p, sh, T, st); }, st));
         std::printf("    quantize + hc_fn GEMV (16384 -> 24) %8.2f us\n", median_us([&] {

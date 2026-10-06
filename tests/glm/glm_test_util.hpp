@@ -11,6 +11,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -115,28 +116,49 @@ inline bool bitwise(const char* name, const float* a, const float* b, size_t n) 
     return true;
 }
 
-/// Median time in microseconds of `reps` calls of f (each bracketed by events on `stream`), after `warm` calls.
+/// Median time in microseconds of one call of f: `reps` calls issued back to back on `stream`, an event recorded
+/// between consecutive calls, the host waiting only at the end (so the GPU does not idle, and lower its clocks,
+/// between calls).  `warm` calls first.  The development GPU also drives a desktop, so the median of 100 is taken
+/// `rounds` times and the smallest is returned (the least disturbed round).
 template <typename F>
-double median_us(F&& f, cudaStream_t stream, int reps = 100, int warm = 10) {
-    cudaEvent_t a, b;
-    GLM_CHECK(cudaEventCreate(&a));
-    GLM_CHECK(cudaEventCreate(&b));
+double median_us_once(F&& f, cudaStream_t stream, int reps, int warm) {
+    std::vector<cudaEvent_t> ev((size_t) reps + 1);
+    for (auto& e : ev) GLM_CHECK(cudaEventCreate(&e));
     for (int i = 0; i < warm; ++i) f();
-    GLM_CHECK(cudaStreamSynchronize(stream));
-    std::vector<float> ms;
     for (int i = 0; i < reps; ++i) {
-        GLM_CHECK(cudaEventRecord(a, stream));
+        GLM_CHECK(cudaEventRecord(ev[(size_t) i], stream));
         f();
-        GLM_CHECK(cudaEventRecord(b, stream));
-        GLM_CHECK(cudaEventSynchronize(b));
-        float t = 0;
-        GLM_CHECK(cudaEventElapsedTime(&t, a, b));
-        ms.push_back(t);
     }
-    cudaEventDestroy(a);
-    cudaEventDestroy(b);
+    GLM_CHECK(cudaEventRecord(ev[(size_t) reps], stream));
+    GLM_CHECK(cudaEventSynchronize(ev[(size_t) reps]));
+    std::vector<float> ms((size_t) reps);
+    for (int i = 0; i < reps; ++i) GLM_CHECK(cudaEventElapsedTime(&ms[(size_t) i], ev[(size_t) i], ev[(size_t) i + 1]));
+    for (auto& e : ev) (void) cudaEventDestroy(e);
     std::sort(ms.begin(), ms.end());
     return 1000.0 * ms[ms.size() / 2];
+}
+
+/// The development GPU runs at its automatic power level: its clock ramps up only under sustained load, so ~200 ms of
+/// calls run first (measured on the RX 9070 XT: a ~10 us kernel reads 18 us after 20 warm-up calls, 12 us after 20,000).
+template <typename F>
+double median_us(F&& f, cudaStream_t stream, int reps = 100, int warm = 20, int rounds = 5) {
+    const auto t0 = std::chrono::steady_clock::now();
+    while (std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(200)) {
+        for (int i = 0; i < 50; ++i) f();
+        GLM_CHECK(cudaStreamSynchronize(stream));
+    }
+    double best = 1e30;
+    for (int r = 0; r < rounds; ++r) best = std::min(best, median_us_once(f, stream, reps, warm));
+    return best;
+}
+
+/// The timing floor of this stack: the median_us of a 4-byte cudaMemsetAsync (itself a kernel launch on HIP).
+inline double floor_us(cudaStream_t stream) {
+    void* p = nullptr;
+    GLM_CHECK(cudaMalloc(&p, 4));
+    const double t = median_us([&] { GLM_CHECK(cudaMemsetAsync(p, 0, 4, stream)); }, stream);
+    cudaFree(p);
+    return t;
 }
 
 inline bool has_flag(int argc, char** argv, const char* f) {
