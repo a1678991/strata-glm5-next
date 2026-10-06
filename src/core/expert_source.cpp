@@ -593,6 +593,7 @@ void FileExpertSource::close() {
         stage_grew_ = false;
     }
     ram_reads_.store(0);
+    cold_ = false;
     warm_stamp_.reset();
     warm_hits_.store(0);
     warm_count_.store(0);
@@ -709,6 +710,8 @@ bool FileExpertSource::open_gguf(std::string& err) {
         }
     }
     base_ = maps_.front().base;       // "opened"; mapped_blob answers nullptr in this mode
+    cold_ = std::getenv("STRATA_FILE_COLD") != nullptr && std::atoi(std::getenv("STRATA_FILE_COLD")) != 0;
+    if (cold_) std::fprintf(stderr, "FileExpertSource: STRATA_FILE_COLD: every file-tier read comes from the drive\n");
     warm_stamp_.reset(new std::atomic<uint32_t>[(size_t) (n_layers_ * n_expert_)]());
     for (uint64_t b : layer_blob_bytes_) stage_blob_ = std::max(stage_blob_, b);
     return true;
@@ -728,12 +731,36 @@ bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* d
             std::memcpy(dst + at, role_ptr_[i] + (size_t) ((uint64_t) expert * per), (size_t) per);
             at += per;
         }
+        if (cold_) drop_pages(layer, expert);
         return true;
     }
     const uint8_t* b = mapped_blob(layer, expert);
     if (b == nullptr) return false;
     std::memcpy(dst, b, (size_t) layer_blob_bytes_[(size_t) layer]);
     return true;
+}
+
+// STRATA_FILE_COLD=1 (measurement only): every file-tier read comes from the drive, as on a machine whose page cache
+// cannot hold the file tier (epyc: ~55 GiB of experts outside the RAM tier beside ~10 GiB of page cache).  After a
+// blob is copied its pages leave this process's page tables (madvise DONTNEED) and the page cache (fadvise
+// DONTNEED), and an assembled blob is never served again from the stage buffers (claim_stage refills it).  Off by
+// default; nothing reads it but open_gguf.
+void FileExpertSource::drop_pages(int64_t layer, int64_t expert) const {
+#if defined(_WIN32)
+    (void) layer;
+    (void) expert;
+#else
+    if (role_ptr_.empty()) return;
+    for (int r = 0; r < 3; ++r) {
+        const size_t i = (size_t) (3 * layer + r);
+        const Map& m = maps_[(size_t) role_file_[i]];
+        const uint8_t* p = role_ptr_[i] + (size_t) ((uint64_t) expert * role_bytes_[i]);
+        const uintptr_t pg = 4096, a = (uintptr_t) p & ~(pg - 1);
+        const size_t len = (size_t) ((uintptr_t) p + role_bytes_[i] - a);
+        (void) madvise((void*) a, len, MADV_DONTNEED);
+        (void) posix_fadvise(m.fd, (off_t) (a - (uintptr_t) m.base), (off_t) len, POSIX_FADV_DONTNEED);
+    }
+#endif
 }
 
 // A blob assembled from the three role slices.  The buffer of a (layer, expert) is reused for another only once
@@ -752,6 +779,11 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill) {
         v = it->second;
         stage_epoch_[v] = epoch_;
         stage_used_[v] = seq;
+        if (cold_ && !stage_busy_[v]) {   // STRATA_FILE_COLD: read it again, into the same buffer
+            stage_busy_[v] = 1;
+            fill = true;
+            return false;
+        }
         return true;
     }
     v = stage_buf_.size();

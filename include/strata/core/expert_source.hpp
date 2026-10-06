@@ -546,6 +546,8 @@ private:
     const uint8_t* mapped_blob(int64_t layer, int64_t expert) const;
     /// The blob's bytes from the mapped file(s) - experts.bin, or the three GGUF role slices - into `dst`.
     bool copy_from_files(int64_t layer, int64_t expert, uint8_t* dst) const;
+    /// STRATA_FILE_COLD: the blob's pages out of this process and the page cache (see the .cpp).
+    void drop_pages(int64_t layer, int64_t expert) const;
     bool open_gguf(std::string& err);
     const uint8_t* staged_blob(int64_t layer, int64_t expert);
     bool claim_stage(int64_t key, size_t& v, bool& fill);
@@ -590,6 +592,7 @@ private:
     std::vector<char> stage_busy_;            ///< being filled (outside stage_mu_): never a victim
     std::condition_variable stage_cv_;
     int fetch_threads_ = 8;
+    bool cold_ = false;                       ///< STRATA_FILE_COLD=1: measurement only, see drop_pages
     std::atomic<uint64_t> file_blob_bytes_{0}, file_us_{0};
     std::unique_ptr<std::atomic<uint32_t>[]> warm_stamp_;   ///< per (layer, expert): epoch_ + 1 when warmed
     std::atomic<int64_t> warm_hits_{0}, warm_count_{0};
