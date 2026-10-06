@@ -625,7 +625,12 @@ inline const char* model_arch_name(ModelArch a) {
 /// keys are the ones llama.cpp f1cee99 reads in `llama_model_glm5_next::load_arch_hparams` (src/models/glm5-next.cpp
 /// lines 7-59) plus the generic ones it reads for every model.
 struct Glm5NextGuard {
-    uint32_t block_count = 46;         ///< 45 trunk + 1 NextN (MTP) block
+    /// 45 trunk + 1 NextN (MTP) block: required of a file that carries the NextN block (nextn_predict_layers >= 1,
+    /// the real model).  A file without one is a slice of the trunk (the port's glm-mini fixture: blocks 0-7 of the
+    /// real file, nextn_predict_layers 0) and may have 1 .. max_slice_blocks blocks; every per-layer array must then
+    /// have block_count entries.  The shapes of a block are the real model's either way.
+    uint32_t block_count = 46;
+    uint32_t max_slice_blocks = 45;    ///< a trunk slice holds at most the trunk
     uint32_t hidden = 4096;
     uint32_t head_count = 64;          ///< KDA heads and MLA query heads
     uint32_t kda_head_dim = 128;
@@ -637,7 +642,8 @@ struct Glm5NextGuard {
 };
 
 /// The glm5-next guard: `general.architecture == "glm5-next"`, the pinned shape keys equal, every key the geometry
-/// needs present and numeric, and `attention.head_count_kv` a per-layer array of block_count entries.
+/// needs present and numeric, and `attention.head_count_kv` a per-layer array of block_count entries.  block_count is
+/// pinned (46) for a file with a NextN block and taken from the key, 1 .. 45, for a trunk slice without one.
 inline std::string check_glm5_next(const GgufFile& g, const Glm5NextGuard& want = {}) {
     const MetaValue* arch = g.get("general.architecture");
     if (!arch) return "missing general.architecture";
@@ -648,7 +654,7 @@ inline std::string check_glm5_next(const GgufFile& g, const Glm5NextGuard& want 
         uint64_t want;
     };
     const Req reqs[] = {
-        {"glm5-next.block_count", true, want.block_count},
+        {"glm5-next.block_count", false, 0},
         {"glm5-next.embedding_length", true, want.hidden},
         {"glm5-next.attention.head_count", true, want.head_count},
         {"glm5-next.kda.head_dim", true, want.kda_head_dim},
@@ -682,11 +688,34 @@ inline std::string check_glm5_next(const GgufFile& g, const Glm5NextGuard& want 
             return std::string(r.key) + " = " + std::to_string((long long) v->num()) + ", expected " +
                    std::to_string(r.want);
     }
+    // the block count: pinned for the real model (it carries the NextN block), from the key for a trunk slice
+    const MetaValue* bc = g.get("glm5-next.block_count");
+    if (bc->type == MetaType::F32 || bc->type == MetaType::F64) return "glm5-next.block_count is not an integer";
+    const MetaValue* nextn = g.get("glm5-next.nextn_predict_layers");
+    if (nextn && !nextn->is_num()) return "glm5-next.nextn_predict_layers is not a number";
+    const uint64_t n_nextn = nextn ? nextn->u : 0;
+    uint64_t blocks = bc->u;
+    if (n_nextn > 0) {
+        if (blocks != want.block_count)
+            return "glm5-next.block_count = " + std::to_string(blocks) + ", expected " +
+                   std::to_string(want.block_count) + " (a file with a NextN block is the whole model)";
+    } else if (blocks < 1 || blocks > want.max_slice_blocks) {
+        return "glm5-next.block_count = " + std::to_string(blocks) + " without a NextN block: a trunk slice has 1 .. " +
+               std::to_string(want.max_slice_blocks) + " blocks";
+    }
     const MetaValue* kv = g.get("glm5-next.attention.head_count_kv");
     if (!kv) return "missing glm5-next.attention.head_count_kv";
-    if (kv->type != MetaType::ARRAY || kv->count != want.block_count || kv->items.size() != kv->count)
-        return "glm5-next.attention.head_count_kv must be a per-layer array of " + std::to_string(want.block_count) +
+    if (kv->type != MetaType::ARRAY || kv->count != blocks || kv->items.size() != kv->count)
+        return "glm5-next.attention.head_count_kv must be a per-layer array of " + std::to_string(blocks) +
                " entries (the layer types come from it)";
+    // the other per-layer keys llama.cpp reads with get_key_or_arr: a scalar, or an array of block_count entries
+    for (const char* key : {"glm5-next.expert_feed_forward_length", "glm5-next.swiglu_clamp_exp",
+                            "glm5-next.swiglu_clamp_shexp"}) {
+        const MetaValue* v = g.get(key);
+        if (v && v->type == MetaType::ARRAY && (v->count != blocks || v->items.size() != v->count))
+            return std::string(key) + " must be one value or a per-layer array of " + std::to_string(blocks) +
+                   " entries";
+    }
     return {};
 }
 
