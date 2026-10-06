@@ -16,7 +16,8 @@ target_sources(strata_kernels PRIVATE
   src/kernels/cuda/kda_decode.cu
   src/kernels/cuda/mhc.cu
   src/kernels/cuda/router_sigmoid.cu
-  src/kernels/cuda/ffn_clamp.cu)
+  src/kernels/cuda/ffn_clamp.cu
+  src/kernels/cuda/glm_moe.cu)
 
 if(NOT STRATA_BUILD_TESTS)
   return()
