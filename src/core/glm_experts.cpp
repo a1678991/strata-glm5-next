@@ -23,6 +23,9 @@ uint64_t up(uint64_t n) { return (n + kAlign - 1) / kAlign * kAlign; }
 }  // namespace
 
 GlmExperts::~GlmExperts() {
+    if (ev_ram_) cudaEventDestroy((cudaEvent_t) ev_ram_);
+    if (ev_file_) cudaEventDestroy((cudaEvent_t) ev_file_);
+    if (copy_) cudaStreamDestroy((cudaStream_t) copy_);
     if (h_plan_) cudaFreeHost(h_plan_);
     if (h_ids_) cudaFreeHost(h_ids_);
     if (h_w_) cudaFreeHost(h_w_);
@@ -75,7 +78,7 @@ bool GlmExperts::init(const ModelGeometry& g, ExpertCache* cache, FileExpertSour
                    o_ffn = take(sk::ffn_clamp_scratch_bytes((int) E, (int) ff_sh, max_t)),
                    o_stage = take(slot_bytes_ * (uint64_t) cap);
     plan_bytes_ = up((uint64_t) cap * 8 + (uint64_t) (cap + 1) * 4 + 4 + (uint64_t) cap * 8);
-    const uint64_t o_plan = take(plan_bytes_);
+    const uint64_t o_plan = take(2 * plan_bytes_);   // two plans (wave 4): VRAM-and-RAM groups, file-tier groups
     if (cudaMalloc(&arena_, off) != cudaSuccess) {
         cudaGetLastError();
         err = "glm experts: cudaMalloc of " + std::to_string(off >> 20) + " MiB (staging for " + std::to_string(cap) +
@@ -93,13 +96,24 @@ bool GlmExperts::init(const ModelGeometry& g, ExpertCache* cache, FileExpertSour
     ffn_scratch_ = b + o_ffn;
     staging_ = b + o_stage;
     plan_ = b + o_plan;
-    if (cudaHostAlloc(&h_plan_, plan_bytes_, cudaHostAllocDefault) != cudaSuccess ||
+    if (cudaHostAlloc(&h_plan_, 2 * plan_bytes_, cudaHostAllocDefault) != cudaSuccess ||
         cudaHostAlloc((void**) &h_ids_, (size_t) cap * 4, cudaHostAllocDefault) != cudaSuccess ||
         cudaHostAlloc((void**) &h_w_, (size_t) cap * 4, cudaHostAllocDefault) != cudaSuccess) {
         err = "glm experts: pinned staging";
         return false;
     }
-    return true;
+    cudaStream_t cs = nullptr;
+    cudaEvent_t e1 = nullptr, e2 = nullptr;
+    if (cudaStreamCreateWithFlags(&cs, cudaStreamNonBlocking) != cudaSuccess ||
+        cudaEventCreateWithFlags(&e1, cudaEventDisableTiming) != cudaSuccess ||
+        cudaEventCreateWithFlags(&e2, cudaEventDisableTiming) != cudaSuccess) {
+        err = "glm experts: the copy stream";
+        return false;
+    }
+    copy_ = cs;
+    ev_ram_ = e1;
+    ev_file_ = e2;
+    return fetch_.init(g, cache, src, max_t, slot_bytes_, err);
 }
 
 bool GlmExperts::moe(const GlmLayerWeights& w, const float* x, int T, float* out, void* stream, std::string& err) {
@@ -120,14 +134,11 @@ bool GlmExperts::moe(const GlmLayerWeights& w, const float* x, int T, float* out
         err = std::string("glm experts: router: ") + cudaGetErrorString(e);
         return false;
     }
-    // the plan: one group per distinct expert (first-seen order), its entries (token t, rank j) -> row t * k + j
+    // the plan: one group per distinct expert (first-seen order), its entries (token t, rank j) -> row t * k + j.
+    // Wave 4: two plans.  Plan 0 holds the groups whose bytes are in VRAM before any file read lands (the cache's
+    // hits and the RAM tier's copies) and is computed while the file tier's reads run; plan 1 the file tier's groups,
+    // each copied into VRAM as its read lands.  Every entry row is written by exactly one group, as before.
     const auto t0 = std::chrono::steady_clock::now();
-    uint8_t* hp = (uint8_t*) h_plan_;
-    auto* grp_ptr = (unsigned long long*) hp;
-    auto* grp_start = (int32_t*) (hp + (size_t) cap * 8);
-    auto* n_groups = grp_start + cap + 1;
-    auto* ent_dst = n_groups + 1;
-    auto* ent_tok = ent_dst + cap;
     std::vector<int32_t> experts;
     experts.reserve((size_t) cap);
     for (int i = 0; i < T * k_; ++i) {
@@ -135,58 +146,94 @@ bool GlmExperts::moe(const GlmLayerWeights& w, const float* x, int T, float* out
         if (e < 0 || e >= g_.n_expert) { err = "glm experts: router id out of range"; return false; }
         if (std::find(experts.begin(), experts.end(), e) == experts.end()) experts.push_back(e);
     }
-    int32_t n_ent = 0, n_staged = 0;
-    const uint64_t blob = lay_[(size_t) l].bytes;
+    // the tiers: 0 VRAM, 1 the RAM tier, 2 the file tier
+    std::vector<uint8_t> tier(experts.size()), file(experts.size());
     for (size_t gi = 0; gi < experts.size(); ++gi) {
         const int32_t e = experts[gi];
-        grp_start[gi] = n_ent;
-        for (int i = 0; i < T * k_; ++i)
-            if (h_ids_[i] == e) {
-                ent_dst[n_ent] = i;
-                ent_tok[n_ent] = i / k_;
-                ++n_ent;
-            }
-        const int32_t slot = cache_ != nullptr ? cache_->slot_of(l, e) : kNotResident;
-        if (slot != kNotResident) {
-            grp_ptr[gi] = (unsigned long long) (uintptr_t) cache_->device_slot(slot);
-            ++st_.vram;
-            continue;
-        }
-        const bool ram = src_->has_resident(l, e);
-        const uint8_t* hb = src_->blob(l, e);
-        if (hb == nullptr) {
-            err = "glm experts: no blob for layer " + std::to_string(l) + " expert " + std::to_string(e);
-            return false;
-        }
-        uint8_t* dst = staging_ + (uint64_t) n_staged * slot_bytes_;
-        // synchronous: a file-tier blob lives in the source's staging ring, which a later blob() may reuse
-        if (const cudaError_t ce = cudaMemcpy(dst, hb, blob, cudaMemcpyHostToDevice); ce != cudaSuccess) {
-            err = std::string("glm experts: staging copy: ") + cudaGetErrorString(ce);
-            return false;
-        }
-        grp_ptr[gi] = (unsigned long long) (uintptr_t) dst;
-        ++n_staged;
-        st_.staged_bytes += blob;
-        ++(ram ? st_.ram : st_.file);
+        tier[gi] = cache_ != nullptr && cache_->slot_of(l, e) != kNotResident ? 0 : src_->has_resident(l, e) ? 1 : 2;
+        file[gi] = tier[gi] == 2;
     }
-    grp_start[experts.size()] = n_ent;
-    *n_groups = (int32_t) experts.size();
+    if (fetch_.active()) fetch_.begin(l, experts.data(), file.data(), (int) experts.size());
+    cudaStream_t cs = (cudaStream_t) copy_;
+    int32_t n_staged = 0;
+    const uint64_t blob = lay_[(size_t) l].bytes;
+    int32_t n_ent_all = 0;
+    for (int p = 0; p < 2; ++p) {
+        uint8_t* hp = (uint8_t*) h_plan_ + (size_t) p * plan_bytes_;
+        auto* grp_ptr = (unsigned long long*) hp;
+        auto* grp_start = (int32_t*) (hp + (size_t) cap * 8);
+        auto* n_groups = grp_start + cap + 1;
+        auto* ent_dst = n_groups + 1;
+        auto* ent_tok = ent_dst + cap;
+        int32_t n_ent = 0, n_grp = 0;
+        for (size_t gi = 0; gi < experts.size(); ++gi) {
+            if ((tier[gi] == 2) != (p == 1)) continue;
+            const int32_t e = experts[gi];
+            grp_start[n_grp] = n_ent;
+            for (int i = 0; i < T * k_; ++i)
+                if (h_ids_[i] == e) {
+                    ent_dst[n_ent] = i;
+                    ent_tok[n_ent] = i / k_;
+                    ++n_ent;
+                }
+            if (tier[gi] == 0) {
+                grp_ptr[n_grp++] = (unsigned long long) (uintptr_t) cache_->device_slot(cache_->slot_of(l, e));
+                ++st_.vram;
+                continue;
+            }
+            uint8_t* dst = staging_ + (uint64_t) n_staged * slot_bytes_;
+            if (!stage_miss(l, e, tier[gi] == 2, dst, blob, err)) return false;
+            grp_ptr[n_grp++] = (unsigned long long) (uintptr_t) dst;
+            ++n_staged;
+            st_.staged_bytes += blob;
+            ++(tier[gi] == 1 ? st_.ram : st_.file);
+        }
+        grp_start[n_grp] = n_ent;
+        *n_groups = n_grp;
+        n_ent_all += n_ent;
+        if (n_grp == 0) continue;
+        // this plan's copies have landed before its groups run
+        cudaEventRecord((cudaEvent_t) (p == 0 ? ev_ram_ : ev_file_), cs);
+        cudaStreamWaitEvent(st, (cudaEvent_t) (p == 0 ? ev_ram_ : ev_file_), 0);
+        uint8_t* dp = (uint8_t*) plan_ + (size_t) p * plan_bytes_;
+        cudaMemcpyAsync(dp, hp, plan_bytes_, cudaMemcpyHostToDevice, st);
+        const auto* d_ptr = (const unsigned long long*) dp;
+        const auto* d_start = (const int32_t*) (dp + (size_t) cap * 8);
+        const int32_t* d_n = d_start + cap + 1;
+        const int32_t* d_dst = d_n + 1;
+        const int32_t* d_tok = d_dst + cap;
+        sk::native_expert_grouped(lay_[(size_t) l], d_ptr, d_start, d_n, d_dst, d_tok, cap, cap, xq_, scratch_, parts_,
+                                  st);
+    }
     st_.ms_fetch += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     st_.groups += (int64_t) experts.size();
-    st_.entries += n_ent;
+    st_.entries += n_ent_all;
     ++st_.windows;
-    cudaMemcpyAsync(plan_, h_plan_, plan_bytes_, cudaMemcpyHostToDevice, st);
-    const uint8_t* dp = (const uint8_t*) plan_;
-    const auto* d_ptr = (const unsigned long long*) dp;
-    const auto* d_start = (const int32_t*) (dp + (size_t) cap * 8);
-    const int32_t* d_n = d_start + cap + 1;
-    const int32_t* d_dst = d_n + 1;
-    const int32_t* d_tok = d_dst + cap;
-    sk::native_expert_grouped(lay_[(size_t) l], d_ptr, d_start, d_n, d_dst, d_tok, cap, cap, xq_, scratch_, parts_, st);
     sk::glm_moe_combine(parts_, w_, shared_, out, (int) E, k_, T, st);
-    // h_plan_ is rewritten by the next call: its upload must have landed
+    // h_plan_ is rewritten by the next call: its upload must have landed (and with it every staging copy, so the
+    // file tier's host slots may be reused)
     if (const cudaError_t e = cudaStreamSynchronize(st); e != cudaSuccess) {
         err = std::string("glm experts: ") + cudaGetErrorString(e);
+        return false;
+    }
+    if (fetch_.active()) fetch_.end();
+    return true;
+}
+
+// One miss into its VRAM staging slot, on the copy stream.  The RAM tier: from the page-locked copy (a DMA; a pageable
+// copy is a synchronous one).  The file tier: from the fetch's host slot once its read has landed (wave 4), or, with
+// the fetch off, through FileExpertSource::blob, whose stage buffer a later blob() may reuse - so synchronously.
+bool GlmExperts::stage_miss(int64_t l, int32_t e, bool from_file, uint8_t* dst, uint64_t blob, std::string& err) {
+    cudaStream_t cs = (cudaStream_t) copy_;
+    const uint8_t* hb = from_file && fetch_.active() ? fetch_.wait(l, e, err) : src_->blob(l, e);
+    if (hb == nullptr) {
+        if (err.empty()) err = "glm experts: no blob for layer " + std::to_string(l) + " expert " + std::to_string(e);
+        return false;
+    }
+    const cudaError_t ce = from_file && !fetch_.active() ? cudaMemcpy(dst, hb, blob, cudaMemcpyHostToDevice)
+                                                         : cudaMemcpyAsync(dst, hb, blob, cudaMemcpyHostToDevice, cs);
+    if (ce != cudaSuccess) {
+        err = std::string("glm experts: staging copy: ") + cudaGetErrorString(ce);
         return false;
     }
     return true;

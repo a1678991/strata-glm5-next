@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -523,6 +524,7 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
 }
 
 void FileExpertSource::close() {
+    stop_reader();   // its threads read the mappings below
     if (complement_arena_ != nullptr) {
         if (complement_pinned_ && !complement_partial_) (void) cudaFreeHost(complement_arena_);
         else {
@@ -1894,6 +1896,263 @@ bool FileExpertSource::pcie_layer(int64_t layer) const {
     if (complement_ready_ && complement_pinned_ && complement_device_ != nullptr)
         return layer >= 0 && layer < n_layers_;
     return device_alias(layer, 0) != nullptr;
+}
+
+// ================================ WAVE 4: THE GLM DECODE'S READER ================================
+//
+// A pool of threads reading whole blobs of the GGUF in place into the caller's buffers (glm_fetch.cpp's page-locked
+// slots).  Each blob is split into parts of `part_bytes`; a thread takes the next part of the first urgent ticket,
+// else of the first speculative one.  Measured on this workstation's NVMe (fetch_bench, cold, batches of two
+// 11.7 MB experts that must land before the next batch, 2 MiB parts): memcpy out of the mapping 2.6 GB/s at 8
+// threads, 3.3 at 16; buffered pread 3.7 / 4.4; O_DIRECT 4.6 / 5.0 (rf_bench's unbatched whole experts: 3.3 at 8
+// threads).  madvise or fadvise WILLNEED, issued for the batch or one batch ahead, changed nothing (2.6).
+
+bool FileExpertSource::start_reader(const ReaderOptions& o, std::string& err) {
+    if (role_ptr_.empty()) { err = "FileExpertSource: the reader needs the GGUF in place"; return false; }
+    if (!reader_.empty()) {
+        if (o.threads == ropt_.threads && o.part_bytes == ropt_.part_bytes && o.io == ropt_.io) return true;
+        stop_reader();
+    }
+    ropt_ = o;
+    ropt_.threads = std::max(1, std::min(256, ropt_.threads));
+    ropt_.part_bytes = std::max<uint64_t>(64 << 10, (ropt_.part_bytes + 4095) / 4096 * 4096);
+#if defined(_WIN32)
+    ropt_.io = ReadIo::Mmap;
+#else
+    direct_fd_.assign(maps_.size(), -1);
+    if (ropt_.io == ReadIo::Direct) {
+        for (size_t i = 0; i < maps_.size(); ++i) {
+            direct_fd_[i] = ::open(paths_[i].c_str(), O_RDONLY | O_DIRECT);
+            if (direct_fd_[i] < 0) {
+                std::fprintf(stderr, "FileExpertSource: %s cannot be read O_DIRECT; buffered reads instead\n",
+                             paths_[i].c_str());
+                for (int& fd : direct_fd_)
+                    if (fd >= 0) ::close(fd);
+                direct_fd_.assign(maps_.size(), -1);
+                ropt_.io = ReadIo::Pread;
+                break;
+            }
+        }
+    }
+#endif
+    {
+        std::lock_guard<std::mutex> lk(rmu_);
+        rquit_ = false;
+        rq_urgent_.clear();
+        rq_spec_.clear();
+        rinflight_ = 0;
+        rstats_ = ReaderStats{};
+    }
+    for (int t = 0; t < ropt_.threads; ++t) reader_.emplace_back([this] { reader_loop(); });
+    return true;
+}
+
+void FileExpertSource::stop_reader() {
+    if (reader_.empty()) return;
+    {
+        std::lock_guard<std::mutex> lk(rmu_);
+        rquit_ = true;
+        // queued tickets that no thread will take: finished as failed, so that no waiter blocks
+        for (auto* q : {&rq_urgent_, &rq_spec_})
+            for (ReadTicket* t : *q) {
+                const int untaken = t->n_parts - t->next;
+                t->next = t->n_parts;
+                t->queue = 0;
+                t->failed.store(true);
+                if (t->left.fetch_sub(untaken) == untaken) t->done = true;
+            }
+        rq_urgent_.clear();
+        rq_spec_.clear();
+    }
+    rwork_.notify_all();
+    for (auto& t : reader_) t.join();
+    reader_.clear();
+    rdone_.notify_all();
+#if !defined(_WIN32)
+    for (int& fd : direct_fd_)
+        if (fd >= 0) ::close(fd);
+#endif
+    direct_fd_.clear();
+}
+
+void FileExpertSource::read_async(ReadTicket& t, int64_t layer, int64_t expert, uint8_t* dst, bool urgent) {
+    const bool ok = !reader_.empty() && dst != nullptr && layer >= 0 && expert >= 0 && layer < n_layers_ &&
+                    expert < n_expert_ && role_ptr_[(size_t) (3 * layer)] != nullptr;
+    t.layer = layer;
+    t.expert = expert;
+    t.dst = dst;
+    t.failed.store(!ok);
+    if (!ok) {
+        std::lock_guard<std::mutex> lk(rmu_);
+        t.n_parts = t.next = 0;
+        t.queue = 0;
+        t.left.store(0);
+        t.done = true;
+        return;
+    }
+    const uint64_t blob = layer_blob_bytes_[(size_t) layer];
+    {
+        std::lock_guard<std::mutex> lk(rmu_);
+        t.n_parts = (int) ((blob + ropt_.part_bytes - 1) / ropt_.part_bytes);
+        t.next = 0;
+        t.left.store(t.n_parts);
+        t.done = false;
+        t.queue = urgent ? 1 : 2;
+        (urgent ? rq_urgent_ : rq_spec_).push_back(&t);
+        if (rinflight_++ == 0) rbusy_t0_ = std::chrono::steady_clock::now();
+    }
+    if (t.n_parts > 1) rwork_.notify_all();
+    else rwork_.notify_one();
+}
+
+void FileExpertSource::read_promote(ReadTicket& t) {
+    std::lock_guard<std::mutex> lk(rmu_);
+    if (t.queue != 2) return;
+    rq_spec_.erase(std::find(rq_spec_.begin(), rq_spec_.end(), &t));
+    rq_urgent_.push_back(&t);
+    t.queue = 1;
+}
+
+bool FileExpertSource::read_cancel(ReadTicket& t) {
+    std::lock_guard<std::mutex> lk(rmu_);
+    if (t.done || t.next != 0 || t.queue == 0) return false;   // finished, or a part already taken
+    auto& q = t.queue == 1 ? rq_urgent_ : rq_spec_;
+    q.erase(std::find(q.begin(), q.end(), &t));
+    t.queue = 0;
+    t.n_parts = 0;
+    t.left.store(0);
+    t.done = true;
+    ++rstats_.cancelled;
+    if (--rinflight_ == 0)
+        rstats_.busy_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - rbusy_t0_).count();
+    return true;
+}
+
+bool FileExpertSource::read_wait(ReadTicket& t) {
+    std::unique_lock<std::mutex> lk(rmu_);
+    rdone_.wait(lk, [&] { return t.done; });
+    return !t.failed.load();
+}
+
+bool FileExpertSource::read_done(ReadTicket& t) {
+    std::lock_guard<std::mutex> lk(rmu_);
+    return t.done;
+}
+
+FileExpertSource::ReaderStats FileExpertSource::reader_stats() const {
+    std::lock_guard<std::mutex> lk(rmu_);
+    ReaderStats s = rstats_;
+    if (rinflight_ > 0)
+        s.busy_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - rbusy_t0_).count();
+    return s;
+}
+
+void FileExpertSource::reader_loop() {
+    const size_t bounce_bytes = (size_t) ropt_.part_bytes + 2 * 4096;
+    uint8_t* bounce = nullptr;
+#if !defined(_WIN32)
+    if (ropt_.io == ReadIo::Direct) {
+        void* p = nullptr;
+        if (posix_memalign(&p, 4096, bounce_bytes) == 0) bounce = (uint8_t*) p;
+    }
+#endif
+    for (;;) {
+        ReadTicket* t = nullptr;
+        int part = 0;
+        {
+            std::unique_lock<std::mutex> lk(rmu_);
+            rwork_.wait(lk, [&] { return rquit_ || !rq_urgent_.empty() || !rq_spec_.empty(); });
+            if (rquit_) break;
+            auto& q = !rq_urgent_.empty() ? rq_urgent_ : rq_spec_;
+            t = q.front();
+            part = t->next++;
+            if (t->next == t->n_parts) {
+                q.erase(q.begin());
+                t->queue = 0;
+            }
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool ok = read_part(*t, part, bounce);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (!ok) t->failed.store(true);
+        if (t->left.fetch_sub(1) == 1) {
+            const uint64_t bytes = layer_blob_bytes_[(size_t) t->layer];
+            if (!t->failed.load()) {
+                file_read_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+                file_blob_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+                if (complement_ready_) file_reads_.fetch_add(1, std::memory_order_relaxed);
+            }
+            {
+                std::lock_guard<std::mutex> lk(rmu_);
+                t->done = true;
+                rstats_.part_ms += ms;
+                ++rstats_.blobs;
+                if (!t->failed.load()) rstats_.bytes += bytes;
+                if (--rinflight_ == 0)
+                    rstats_.busy_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                                                 rbusy_t0_).count();
+            }
+            rdone_.notify_all();
+        } else {
+            std::lock_guard<std::mutex> lk(rmu_);
+            rstats_.part_ms += ms;
+        }
+        file_us_.fetch_add((uint64_t) (ms * 1000.0), std::memory_order_relaxed);
+    }
+    std::free(bounce);
+}
+
+// Part `part` of t's blob: the bytes [lo, hi) of [gate rows | up rows | down rows], up to three slices of the files.
+bool FileExpertSource::read_part(const ReadTicket& t, int part, uint8_t* bounce) {
+    const int64_t layer = t.layer, e = t.expert;
+    const uint64_t blob = layer_blob_bytes_[(size_t) layer], lo = (uint64_t) part * ropt_.part_bytes,
+                   hi = std::min(blob, lo + ropt_.part_bytes);
+    uint64_t at = 0;
+    for (int r = 0; r < 3; ++r) {
+        const size_t i = (size_t) (3 * layer + r);
+        const uint64_t per = role_bytes_[i], a = std::max(lo, at), b = std::min(hi, at + per);
+        if (a < b) {
+            const uint8_t* src = role_ptr_[i] + (size_t) ((uint64_t) e * per + (a - at));
+            uint8_t* dst = t.dst + a;
+            const size_t n = (size_t) (b - a);
+#if defined(_WIN32)
+            std::memcpy(dst, src, n);
+#else
+            const Map& m = maps_[(size_t) role_file_[i]];
+            const uint64_t off = (uint64_t) (src - m.base);
+            if (ropt_.io == ReadIo::Direct && bounce != nullptr) {
+                const uint64_t a0 = off / 4096 * 4096, a1 = (off + n + 4095) / 4096 * 4096;
+                size_t got = 0;
+                const size_t need = (size_t) (off + n - a0);
+                while (got < need) {
+                    const ssize_t g = ::pread(direct_fd_[(size_t) role_file_[i]], bounce + got, (size_t) (a1 - a0) - got,
+                                              (off_t) (a0 + got));
+                    if (g < 0 && errno == EINTR) continue;
+                    if (g <= 0) return false;
+                    got += (size_t) g;
+                }
+                std::memcpy(dst, bounce + (off - a0), n);
+            } else if (ropt_.io == ReadIo::Pread || ropt_.io == ReadIo::Direct) {
+                for (size_t got = 0; got < n;) {
+                    const ssize_t g = ::pread(m.fd, dst + got, n - got, (off_t) (off + got));
+                    if (g < 0 && errno == EINTR) continue;
+                    if (g <= 0) return false;
+                    got += (size_t) g;
+                }
+            } else {
+                std::memcpy(dst, src, n);
+            }
+            if (cold_ && ropt_.io != ReadIo::Direct) {   // STRATA_FILE_COLD: as drop_pages, this slice only
+                const uintptr_t a0 = (uintptr_t) src & ~(uintptr_t) 4095;
+                const size_t len = (size_t) ((uintptr_t) src + n - a0);
+                if (ropt_.io == ReadIo::Mmap) (void) madvise((void*) a0, len, MADV_DONTNEED);
+                (void) posix_fadvise(m.fd, (off_t) (a0 - (uintptr_t) m.base), (off_t) len, POSIX_FADV_DONTNEED);
+            }
+#endif
+        }
+        at += per;
+    }
+    return true;
 }
 
 // ================================ THE ADAPTER ================================

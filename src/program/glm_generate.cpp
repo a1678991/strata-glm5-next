@@ -447,6 +447,7 @@ int glm_generate(const GlmRunArgs& a) {
                      (long long) agree, (long long) rows);
     if (any_moe) {
         std::fprintf(stderr, "strata generate: %s\n", experts.stats_line().c_str());
+        std::fprintf(stderr, "strata generate: %s\n", experts.fetch_line().c_str());
         std::fprintf(stderr, "strata generate: glm5-next: file tier: %lld reads, %.1f MB, %.1f ms; RAM tier reads %lld\n",
                      (long long) src.file_reads(), (double) src.file_read_bytes() / 1e6, src.file_ms(),
                      (long long) src.ram_reads());
