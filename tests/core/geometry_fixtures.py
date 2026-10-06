@@ -3,6 +3,8 @@
 
   glm/, qwen/     GLM-5.3-Flash UD-IQ4_XS and Qwen3.8-Flash-Next UD-IQ4_XS, metadata and tensor directories as read
                   on 2026-10-06 (tests/data/gguf_headers/*.json), no tensor data
+  glm-iq3/        GLM-5.3-Flash UD-IQ3_XXS (unsloth a38483c, 4 shards: shard 1 metadata only), read on 2026-10-07
+  glm-iq3-split/  the same with shard 3 declaring split.no 3, which the split check must refuse
   glm-*/          one change each, which the guard, the geometry or the tensor check must refuse
   glm-slice8/     blocks 0-7 of GLM-5.3-Flash as a trunk slice (the port's glm-mini fixture: block_count 8, no NextN
                   block, the per-layer arrays cut to 8, no tensor of blocks 8-45), which the guard must accept
@@ -67,8 +69,17 @@ def glm_slice(glm, n):
     return spec
 
 
+def shard_kv_set(spec, shard, key, value):
+    for e in spec["shards"][shard]["kv"]:
+        if e[0] == key:
+            e[1] = value
+            return spec
+    raise KeyError(key)
+
+
 def main(out):
     glm = fx.load_spec(os.path.join(DATA, "glm5-next-ud-iq4_xs.json"))
+    glm_iq3 = fx.load_spec(os.path.join(DATA, "glm5-next-ud-iq3_xxs.json"))
     qwen = fx.load_spec(os.path.join(DATA, "qwen4exp-ud-iq4_xs.json"))
     variants = {
         "glm": glm,
@@ -89,6 +100,9 @@ def main(out):
         # a trunk slice, accepted; and one whose per-layer array does not match its block count
         "glm-slice8": glm_slice(glm, 8),
         "glm-slice8-kv": kv_set(glm_slice(glm, 8), "glm5-next.attention.head_count_kv", lambda v: list(v) + [0]),
+        # the smaller quant: IQ2_S / IQ3_S experts, Q6_K token_embd and many Q6_K projections, split in 4
+        "glm-iq3": glm_iq3,
+        "glm-iq3-split": shard_kv_set(copy.deepcopy(glm_iq3), 2, "split.no", 3),
     }
     for name, spec in variants.items():
         fx.write_spec(spec, os.path.join(out, name))
