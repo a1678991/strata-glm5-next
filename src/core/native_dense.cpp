@@ -21,7 +21,10 @@ bool in_range(const std::string& name) {
     const int l = std::atoi(name.c_str() + 4);
     return l >= g_layer_lb && l < g_layer_le;
 }
-bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
+/// `dense_ffn`: the model has leading dense FFN layers (glm5-next's layers 0-2, `ffn_{gate,up,down}` [4096, 12288]
+/// Q8_0), whose projections are GEMVs like the others.  A qwen4exp file has no tensor of those names; the flag
+/// keeps even that from changing what a Qwen file serves.
+bool eligible(const strata::TensorInfo& tensor, bool include_ple_key, bool dense_ffn) {
     const auto& name = tensor.name;
     if (name.rfind("blk.", 0) != 0) return false;
     // Match the native PLE kernel: Q2_0, IQ3_XXS, IQ4_XS and Q8_0 (UD-Q4_K_XL). Other keys retain the packed BF16
@@ -32,7 +35,15 @@ bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
         ".attn_q.weight", ".attn_k.weight", ".attn_v.weight", ".attn_output.weight",
         ".ffn_gate_shexp.weight", ".ffn_up_shexp.weight", ".ffn_down_shexp.weight"};
     for (const char* suffix : suffixes) if (name.ends_with(suffix)) return true;
+    static const char* dense[] = {".ffn_gate.weight", ".ffn_up.weight", ".ffn_down.weight"};
+    if (dense_ffn)
+        for (const char* suffix : dense) if (name.ends_with(suffix)) return true;
     return false;
+}
+/// Whether this shard is a glm5-next metadata shard (its dense FFN layers are served natively).
+bool glm_meta(const strata::GgufFile& gguf) {
+    const strata::MetaValue* arch = gguf.get("general.architecture");
+    return arch != nullptr && arch->s == "glm5-next";
 }
 struct DeviceFree { void operator()(void* p) const { if (p) cudaFree(p); } };
 using DevicePtr = std::unique_ptr<void, DeviceFree>;
@@ -47,10 +58,12 @@ struct Pending {
 bool NativeDense::served_names(const std::vector<std::string>& shards, bool include_ple_key,
                                std::set<std::string>& out, std::string& err) {
     try {
+        bool dense_ffn = false;   // the metadata shard comes first (strata::gguf_split_paths)
         for (const auto& path : shards) {
             strata::GgufFile gguf(path);
+            dense_ffn = dense_ffn || glm_meta(gguf);
             for (const auto& tensor : gguf.tensors())
-                if (eligible(tensor, include_ple_key) && strata::kernels::native_mmvq_supported(tensor.type) &&
+                if (eligible(tensor, include_ple_key, dense_ffn) && strata::kernels::native_mmvq_supported(tensor.type) &&
                     tensor.shape.size() == 2)
                     out.insert(tensor.name);
         }
@@ -94,15 +107,18 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         uint64_t split_count = 0, split_tensors = 0;
         std::set<uint64_t> split_numbers;
         bool have_architecture = false;
+        bool dense_ffn = false;
         for (const auto& path : shards) {
             strata::GgufFile gguf(path);
             const auto* count = gguf.get("split.count");
             const auto* number = gguf.get("split.no");
             const auto* tensors = gguf.get("split.tensors.count");
             if (gguf.get("general.architecture")) {
-                err = strata::check_architecture(gguf);
+                strata::ModelArch arch = strata::ModelArch::Unknown;
+                err = strata::check_model_architecture(gguf, &arch);
                 if (!err.empty()) return false;
                 have_architecture = true;
+                dense_ffn = arch == strata::ModelArch::Glm5Next;
                 if (count && number && tensors && number->u == 0 && count->u > 1) {
                     split_count = count->u;
                     split_tensors = tensors->u;
@@ -152,7 +168,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 }
             }
             for (const auto& tensor : gguf.tensors()) {
-                if (!eligible(tensor, include_ple_key) || outside(tensor.name)) continue;
+                if (!eligible(tensor, include_ple_key, dense_ffn) || outside(tensor.name)) continue;
                 if (!in_range(tensor.name) && tensor.name.find("ple") == std::string::npos) continue;
                 if (!seen.insert(tensor.name).second) {
                     err = "native dense: duplicate tensor " + tensor.name; return false;
