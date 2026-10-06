@@ -13,7 +13,8 @@ if(NOT (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP))
 endif()
 
 target_sources(strata_kernels PRIVATE
-  src/kernels/cuda/kda_decode.cu)
+  src/kernels/cuda/kda_decode.cu
+  src/kernels/cuda/mhc.cu)
 
 if(NOT STRATA_BUILD_TESTS)
   return()
@@ -22,7 +23,7 @@ enable_testing()
 
 set(STRATA_GLM_ORACLE_DIR "" CACHE PATH "llama.cpp f1cee99 checkout: the headers of the GLM parity tests' oracle")
 set(STRATA_GLM_ORACLE_BUILD_DIR "" CACHE PATH "its CPU-only shared ggml build (tools/glm/build_oracle.sh)")
-set(_glm_oracle_tests kda_parity)
+set(_glm_oracle_tests kda_parity mhc_parity)
 if(STRATA_GLM_ORACLE_DIR AND STRATA_GLM_ORACLE_BUILD_DIR)
   set(_glm_oracle_libs)
   foreach(_c IN ITEMS ggml ggml-base ggml-cpu)
