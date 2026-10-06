@@ -17,7 +17,11 @@
 //      architecture, type and shape checks and stop at the (absent) payload; NativeDense serves GLM's dense FFN.
 //   5. Native expert formats at GLM's widths (4096 / 2048): blob sizes of the three format pairs of the file and a
 //      45-layer native_experts.txt with three dense layers (STRATA_NATIVE_EXPERTS builds).
+#include "gguf_fixture.hpp"
+
 #include "strata/artifact/gguf_reader.hpp"
+#include "strata/core/expert_source.hpp"
+#include "strata/core/pinned.hpp"
 #include "strata/core/layout.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/core/native_head.hpp"
@@ -25,6 +29,7 @@
 #include "strata/kernels/cpu/native_expert.hpp"
 
 #include <array>
+#include <cstring>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -245,9 +250,12 @@ void loaders(const fs::path& root) {
         for (const auto& n : served)
             dense += n.ends_with(".ffn_gate.weight") || n.ends_with(".ffn_up.weight") || n.ends_with(".ffn_down.weight");
         if (std::string(name) == "glm")
-            check(served.size() == 298 && dense == 9 && served.count("blk.0.ffn_gate.weight") &&
-                      served.count("blk.2.ffn_down.weight"),
-                  "glm: NativeDense serves 298 matrices, the dense FFN of layers 0-2 (9) among them");
+            check(served.size() == 643 && dense == 9 && served.count("blk.0.ffn_gate.weight") &&
+                      served.count("blk.2.ffn_down.weight") && served.count("blk.3.attn_k_b.weight") &&
+                      served.count("blk.0.hc_attn_fn.weight") && !served.count("blk.3.ffn_gate_inp.weight") &&
+                      !served.count("blk.3.ffn_gate_exps.weight"),
+                  "glm: NativeDense serves every Q8_0 non-expert matrix (643: 630 trunk + 13 MTP; 3-D k_b/v_b "
+                  "flattened; the dense FFN's 9 among them), no F32 row, no expert");
         else
             check(served.size() == 300 && dense == 0, "qwen: NativeDense serves the same 300 matrices as before");
     }
@@ -259,6 +267,73 @@ void loaders(const fs::path& root) {
         check(refused, "NativeHead refuses an unknown architecture: " + err);
     }
 }
+
+#if defined(STRATA_NATIVE_EXPERTS)
+/// A layer without experts (GLM's dense 0-2) through the whole file tier, on a 3-layer synthetic model whose layer 0
+/// is dense: the layout, check_experts_gguf, load_experts_gguf and FileExpertSource reading the GGUF in place.
+void dense_layers_in_place(const fs::path& dir) {
+    namespace cpu = strata::kernels::cpu;
+    using fixture::Tensor;
+    constexpr int64_t E = 256, FF = 256, NE = 2;
+    constexpr uint32_t Q8_0 = 8;
+    fs::create_directories(dir / "pack");
+    const fs::path gguf = dir / "Mini.gguf";
+    const std::vector<Tensor> ts = {{"blk.0.ffn_gate.weight", {E, 512}, Q8_0, 1},
+                                    {"blk.1.ffn_gate_exps.weight", {E, FF, NE}, Q8_0, 11},
+                                    {"blk.1.ffn_up_exps.weight", {E, FF, NE}, Q8_0, 12},
+                                    {"blk.1.ffn_down_exps.weight", {FF, E, NE}, Q8_0, 13},
+                                    {"blk.2.ffn_gate_exps.weight", {E, FF, NE}, Q8_0, 21},
+                                    {"blk.2.ffn_up_exps.weight", {E, FF, NE}, Q8_0, 22},
+                                    {"blk.2.ffn_down_exps.weight", {FF, E, NE}, Q8_0, 23}};
+    const fixture::Written w = fixture::write(gguf, {fixture::str("general.architecture", "mini")}, ts);
+    cpu::NativeFmt f;
+    std::string err;
+    if (!cpu::native_fmt((int) Q8_0, (int) Q8_0, E, FF, f, err)) { check(false, "Q8_0 at 256: " + err); return; }
+    auto at = [&](size_t i) { return std::to_string(w.data_start + w.offsets[i]); };
+    {
+        std::ofstream o(dir / "pack" / "native_experts.txt", std::ios::binary);
+        o << "# strata native experts v3: layer gu_type d_type offset blob_bytes gate_off up_off down_off (n_expert 2)\n";
+        o << "1 8 8 0 " << f.bytes << " " << at(1) << " " << at(2) << " " << at(3) << "\n";
+        o << "2 8 8 " << f.bytes * NE << " " << f.bytes << " " << at(4) << " " << at(5) << " " << at(6) << "\n";
+    }
+    const std::string pack = (dir / "pack").string();
+    bool ok = !cpu::expert_layout_load(pack, 3, NE, err, E, FF, 0);
+    check(ok && has(err, "layer 0 is missing"), "without a dense lead, the missing layer 0 is refused: " + err);
+    err.clear();
+    ok = cpu::expert_layout_load(pack, 3, NE, err, E, FF, 1);
+    const cpu::ExpertLayout& L = cpu::expert_layout();
+    check(ok && !L.has_experts(0) && L.has_experts(1) && L.has_experts(2) && L.blob_bytes(0) == 0 &&
+              L.layer_offset(1) == 0 && L.total == 2 * NE * f.bytes,
+          "dense lead 1: layer 0 has no experts, layers 1-2 follow from offset 0" + (err.empty() ? "" : ": " + err));
+    if (!ok) return;
+    ok = strata::core::check_experts_gguf(gguf.string(), L, err);
+    check(ok, "check_experts_gguf skips the dense layer" + (ok ? std::string() : ": " + err));
+    std::vector<uint8_t> arena((size_t) L.total, 0xEE);
+    const strata::core::LoadStats st = strata::core::load_experts_gguf(gguf.string(), arena.data(), L, 2);
+    bool exact = st.ok && st.bytes == L.total;
+    for (int64_t l = 1; l < 3 && exact; ++l)
+        for (int64_t e = 0; e < NE && exact; ++e) {
+            const uint64_t per[3] = {f.up_off, f.up_off, f.bytes - f.down_off}, off[3] = {0, f.up_off, f.down_off};
+            for (int r = 0; r < 3 && exact; ++r)
+                for (uint64_t j = 0; j < per[r]; ++j)
+                    if (arena[(size_t) (L.blob_offset(l, e) + off[r] + j)] !=
+                        fixture::pattern((uint8_t) (10 * l + 1 + r), (uint64_t) e * per[r] + j)) { exact = false; break; }
+        }
+    check(exact, "load_experts_gguf: every blob of layers 1-2 is its tensors' bytes");
+    strata::core::FileExpertSource src;
+    src.set_gguf(gguf.string());
+    ok = src.open(pack, 3, NE, err);
+    bool same = ok && src.gguf_mode();
+    for (int64_t l = 1; l < 3 && same; ++l)
+        for (int64_t e = 0; e < NE && same; ++e) {
+            src.begin_layer(l, nullptr, 0);
+            const uint8_t* b = src.blob(l, e);
+            same = b != nullptr && std::memcmp(b, arena.data() + L.blob_offset(l, e), (size_t) f.bytes) == 0;
+        }
+    check(same, "FileExpertSource opens a layout with a dense layer and reads layers 1-2 in place" +
+                    (ok ? std::string() : ": " + err));
+}
+#endif
 
 void native_experts(const fs::path& tmp) {
 #if defined(STRATA_NATIVE_EXPERTS)
@@ -314,6 +389,7 @@ void native_experts(const fs::path& tmp) {
     const bool wide = cpu::expert_layout_load(tmp.string(), 45, 288, err, 2560, 640, 3);
     const std::string why = err;
     check(!wide, "the same file at Qwen's widths is refused: " + why);
+    dense_layers_in_place(tmp / "mini");
     // restore the canonical layout for anything after this
     cpu::expert_layout_load((tmp / "none").string(), 48, 512, err);
 #else
@@ -322,9 +398,71 @@ void native_experts(const fs::path& tmp) {
 #endif
 }
 
+/// `model_geometry_test --pack DIR --native SHARD`: a real pack (tools/iq_pack.py) against its model file - headers,
+/// native_experts.txt and index.txt only.  Not a ctest: it needs the pack and the shards (sparse copies do).
+int real_pack(const std::string& pack, const std::string& shard) {
+    namespace cpu = strata::kernels::cpu;
+    std::string err;
+    const std::vector<std::string> shards = strata::gguf_split_paths(shard);
+    const strata::GgufModel m(shards);
+    ModelGeometry g;
+    bool ok = strata::core::geometry_from_gguf(m.meta(), g, err);
+    check(ok, "geometry_from_gguf" + (ok ? std::string() : ": " + err));
+    int64_t checked = 0;
+    ok = strata::core::check_all_gguf(m, g, err, &checked);
+    check(ok, "check_all_gguf: " + std::to_string(checked) + " tensors" + (ok ? std::string() : ": " + err));
+    err.clear();
+    ok = cpu::expert_layout_load(pack, g.n_layers, g.n_expert, err, g.n_embd, g.n_ff, g.n_dense_lead);
+    const cpu::ExpertLayout& L = cpu::expert_layout();
+    check(ok && L.native, "native_experts.txt at the geometry's widths: " + std::to_string(L.total) + " B, largest blob " +
+                              std::to_string(L.max_blob) + (ok ? "" : ": " + err));
+    if (ok) {
+        ok = strata::core::check_experts_gguf(shards.front(), L, err);
+        check(ok, "check_experts_gguf: every layer's expert spans are its tensors" + (ok ? std::string() : ": " + err));
+        strata::core::FileExpertSource src;
+        src.set_gguf(shards.front());
+        ok = src.open(pack, g.n_layers, L.n_expert, err);
+        check(ok && src.gguf_mode(), "FileExpertSource opens the shards in place" + (ok ? std::string() : ": " + err));
+    }
+    // index.txt rows (name, file, kind, ...) against what NativeDense serves from the GGUF
+    std::set<std::string> served, rows, quantized_rows;
+    strata::core::NativeDense::served_names(shards, false, served, err);
+    std::ifstream in(pack + "/index.txt");
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        char name[256];
+        int file = 0, kind = -1;
+        if (std::sscanf(line.c_str(), "%255s %d %d", name, &file, &kind) != 3) continue;
+        rows.insert(name);
+        if (kind == 0 && std::string(name).rfind("blk.", 0) == 0) quantized_rows.insert(name);
+    }
+    int64_t missing = 0, extra = 0;
+    for (const auto& n : quantized_rows) missing += served.count(n) == 0;
+    for (const auto& n : served) extra += rows.count(n) == 0;
+    // glm5-next's pack leaves every quantized non-expert tensor in GGUF form (no bytes in dense.bin): all must be
+    // served.  A Qwen pack keeps some quantized rows in the arena (the PLE key unless --native-ple-key)
+    const std::string what = std::to_string(quantized_rows.size()) + " quantized blk rows of index.txt, " +
+                             std::to_string(quantized_rows.size() - (size_t) missing) + " served natively";
+    if (g.glm()) check(missing == 0, what);
+    else std::printf("  %s\n", what.c_str());
+    std::printf("  served names absent from index.txt (left out by the pack, e.g. the MTP block): %lld\n",
+                (long long) extra);
+    std::printf("%s (%d failed)\n", g_fail ? "FAIL" : "PASS", g_fail);
+    return g_fail ? 1 : 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 5 && std::string(argv[1]) == "--pack" && std::string(argv[3]) == "--native") {
+        try {
+            return real_pack(argv[2], argv[4]);
+        } catch (const std::exception& e) {
+            std::printf("refused: %s\n", e.what());
+            return 1;
+        }
+    }
     if (argc != 2) {
         std::fprintf(stderr, "usage: model_geometry_test FIXTURE_DIR (written by tests/core/geometry_fixtures.py)\n");
         return 2;
