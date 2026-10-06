@@ -335,7 +335,6 @@ int glm_generate(const GlmRunArgs& a) {
         for (int64_t m = std::atoll(v); m < n; m += std::atoll(v)) marks.push_back(m);
     std::sort(marks.begin(), marks.end());
     size_t next_mark = 0;
-    const auto t0 = Clock::now();
     int64_t agree = 0, rows = 0;
     int last_rows = 0;   // rows of the last logits written (the window's, or the prompt path's head)
     double prefill_s = 0.0;
