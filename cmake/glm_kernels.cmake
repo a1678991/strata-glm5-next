@@ -55,11 +55,14 @@ endif()
 # pinned one (strata_kernels_cpu), whose Q6_K arithmetic is f1cee99's.  expert_dump is the Qwen bit-identity tool: its
 # output, built once against the base tree and once against this one, must be byte-identical (see its header).
 if(STRATA_NATIVE_EXPERTS)
-  foreach(_t IN ITEMS expert_parity expert_dump)
+  foreach(_t IN ITEMS expert_parity expert_dump pool_parity)
     add_executable(glm_${_t} tests/glm/${_t}.cpp)
     target_include_directories(glm_${_t} PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(glm_${_t} PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   endforeach()
   add_test(NAME glm_expert_parity COMMAND glm_expert_parity)
   set_tests_properties(glm_expert_parity PROPERTIES TIMEOUT 900)
+  # the RAM-tier experts on the CPU pool (src/core/glm_pool.cpp): the clamped pool phases and the combine's CPU rows
+  add_test(NAME glm_pool_parity COMMAND glm_pool_parity)
+  set_tests_properties(glm_pool_parity PROPERTIES TIMEOUT 900 SKIP_RETURN_CODE 77)
 endif()
