@@ -3,7 +3,6 @@
 
 #include "strata/kernels/f16_bits.hpp"
 
-#include <cublas_v2.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -251,43 +250,6 @@ __global__ void __launch_bounds__(THREADS) prompt_attend_kernel(strata::kernels:
 }
 
 }  // namespace
-
-// ---- Gemm16 -----------------------------------------------------------------------------------------------------
-Gemm16::~Gemm16() {
-    if (handle_) cublasDestroy((cublasHandle_t) handle_);
-}
-
-bool Gemm16::init(void* stream, std::string& err, void* workspace, size_t ws_bytes) {
-    cublasHandle_t h = nullptr;
-    if (const cublasStatus_t s = cublasCreate(&h); s != CUBLAS_STATUS_SUCCESS) {
-        err = "glm prefill gemm: cublasCreate: status " + std::to_string((int) s);
-        return false;
-    }
-    handle_ = h;
-    stream_ = stream;
-    if (cublasSetStream(h, (cudaStream_t) stream) != CUBLAS_STATUS_SUCCESS) {
-        err = "glm prefill gemm: cublasSetStream failed";
-        return false;
-    }
-    if (workspace != nullptr && ws_bytes > 0) cublasSetWorkspace(h, workspace, ws_bytes);
-    cublasSetMathMode(h, CUBLAS_DEFAULT_MATH);
-    return true;
-}
-
-void Gemm16::run(const uint16_t* X, int64_t ldx, const uint16_t* W, float* Y, int64_t ldy, int64_t T, int64_t N,
-                 int64_t K, float beta) {
-    if (T <= 0 || N <= 0) return;
-    const float alpha = 1.0f;
-    // column-major view: Y^T[N, T] = W[N, K] . X^T[K, T]; W is row-major [N][K] = column-major [K][N] transposed
-    const cublasStatus_t s = cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K,
-                                          &alpha, W, CUDA_R_16F, (int) K, X, CUDA_R_16F, (int) ldx, &beta, Y,
-                                          CUDA_R_32F, (int) ldy, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
-    if (s != CUBLAS_STATUS_SUCCESS) {
-        std::fprintf(stderr, "glm prefill gemm: GemmEx T=%lld N=%lld K=%lld: status %d\n", (long long) T, (long long) N,
-                     (long long) K, (int) s);
-        std::exit(1);
-    }
-}
 
 // ---- entry points -----------------------------------------------------------------------------------------------
 void to_f16(const float* x, uint16_t* y, int64_t n, void* stream) {

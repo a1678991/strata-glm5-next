@@ -29,7 +29,10 @@
 
 namespace strata::prefill::glm {
 
-/// The FP16 GEMM of the prompt path (one handle, the caller's stream).
+/// The FP16 GEMM of the prompt path (one handle, the caller's stream).  CUDA: cublasGemmEx (tensor cores).  HIP with
+/// hipBLASLt: hipblasLtMatmul with the library's first heuristic algorithm for the shape, cached per shape (measured
+/// on the RX 9070 XT: 60-130 TFLOPS against hipblasGemmEx's ~11 for these f16 x f16 -> f32 products), hipblasGemmEx
+/// when hipBLASLt has none.  STRATA_GLM_GEMM_LT=0 keeps hipblasGemmEx.
 class Gemm16 {
 public:
     Gemm16() = default;
@@ -46,6 +49,7 @@ public:
 private:
     void* handle_ = nullptr;
     void* stream_ = nullptr;
+    void* lt_ = nullptr;   ///< HIP: the hipBLASLt state (handle, workspace, the per-shape plans)
 };
 
 /// y[i] = f16(x[i]) (round to nearest even), n values.

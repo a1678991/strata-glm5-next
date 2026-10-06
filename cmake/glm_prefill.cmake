@@ -9,11 +9,16 @@ if(NOT (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP))
   return()
 endif()
 
-add_library(strata_glm_prefill_kernels STATIC src/prefill/glm_prefill_kernels.cu)
+add_library(strata_glm_prefill_kernels STATIC src/prefill/glm_prefill_kernels.cu src/prefill/glm_gemm16.cu)
 target_include_directories(strata_glm_prefill_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
                            ${_strata_gpu_include_directories})
 target_link_libraries(strata_glm_prefill_kernels PUBLIC strata_dsa_kernels ${_strata_gpu_blas_target}
                       ${_strata_gpu_runtime_target})
+if(STRATA_ENABLE_HIP AND STRATA_HIPBLASLT_AVAILABLE)
+  # the FP16 GEMM through hipBLASLt's heuristic algorithm (Gemm16): ~6-10x hipblasGemmEx on gfx1201
+  target_compile_definitions(strata_glm_prefill_kernels PRIVATE STRATA_HIPBLASLT_AVAILABLE=1)
+  target_link_libraries(strata_glm_prefill_kernels PUBLIC roc::hipblaslt)
+endif()
 
 if(TARGET strata_prefill)
   target_sources(strata_prefill PRIVATE src/prefill/glm_prefill.cpp)
