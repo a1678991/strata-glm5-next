@@ -36,6 +36,45 @@ For ordinary quants, --compat-bf16 dequantizes the small projections that the en
 round-to-nearest-even. This introduces BF16 rounding; it does not reconstruct the original full-precision
 weights. Experts, native attention projections, token embeddings, a Q2_0/Q8_0 PLE key and the disk-backed PLE
 table stay unchanged.
+
+GLM-5.3-Flash (general.architecture `glm5-next`, llama.cpp f1cee99) packs into the same two files, unchanged in
+format; what differs is chosen by the architecture (FORMS below).  Every other architecture keeps the Qwen table and
+the Qwen code path, so a Qwen pack is byte-identical to what this tool wrote before GLM existed.
+
+  layers without experts  blk.0-2 are dense (`leading_dense_block_count` 3: ffn_{gate,up,down}, no router, no
+                       experts).  native_experts.txt has no line for them: its lines name the layers that do have
+                       experts, the offsets run contiguously over those lines only, and n_expert comes from the
+                       first MoE layer's router (blk.3), not blk.0.  A layer without experts must have none of the
+                       three expert tensors and no router, and only the `leading_dense_block_count` leading layers
+                       may be such layers; a model without that key still needs experts in every layer, as before.
+  the MTP layer        the last `nextn_predict_layers` blocks (blk.45) are left out of both files for now - their
+                       experts, router, attention and nextn.* tensors - so the trunk is 45 layers and its experts
+                       are layers 3-44.  The MTP drafter (port plan stage 8) will take it up.
+  dense set vs native  GLM's file stores everything as Q8_0 / Q6_K except norms, biases and small F32 tensors, and
+                       every kernel that will read them is new, so the table keeps the GGUF's own encoding: every
+                       quantized tensor is served natively from the GGUF (shape-only index rows, as Qwen's large
+                       projections) and is never rounded to BF16, and the float tensors go to dense.bin as F32 -
+                       the bytes llama.cpp computes with.  This departs on purpose from the Qwen table's BF16 forms
+                       (hc_* mixing, routers, small SSM and indexer projections), which exist because the Qwen
+                       kernels read GSQ-RCO's BF16 projections; GLM has neither such kernels nor BF16 tensors, so
+                       --compat-bf16 rounds nothing for it.
+                         dense.bin, F32: attn_norm, ffn_norm, output_norm, ssm_norm (KDA output norm),
+                           attn_q_a_norm, attn_kv_a_norm (MLA), indexer.k_norm weight and bias; hc_{attn,ffn}_base
+                           and _scale (mHC); ffn_gate_inp (the router, F32 as llama.cpp reads it: sigmoid scores
+                           plus a selection bias are tie-sensitive, and the port plan's VRAM table counts it at
+                           F32, 189 MiB) and exp_probs_b.bias; ssm_a, ssm_dt.bias, ssm_conv1d_{q,k,v} (KDA);
+                           indexer.proj and indexer_compressor_ape (DSA indexer).
+                         native (GGUF): hc_{attn,ffn}_fn (mHC); attn_{q,k,v}, ssm_{beta,f_a,f_b,g_a,g_b} and
+                           attn_output (KDA); attn_q_a, attn_q_b, attn_kv_a_mqa, attn_k_b, attn_v_b (MLA);
+                           indexer.attn_k, indexer.attn_q_b, indexer_compressor_gate (DSA indexer);
+                           ffn_{gate,up,down}_shexp (shared expert); ffn_{gate,up,down} (dense FFN, layers 0-2);
+                           token_embd (Q8_0) and output (Q6_K).
+                         excluded: the routed experts (native_experts.txt) and everything of blk.45.
+  three dimensions     the index holds two.  ssm_conv1d_{q,k,v} [4, 1, 8192] and attn_{k,v}_b [256, 512, 64] are
+                       written as [ne0, ne1 x ne2] - ggml's row view of the same bytes ([4, 8192] is the
+                       [d_conv, channels] form of Qwen's ssm_conv1d); a native reader takes the true shape from the
+                       GGUF.  Only glm5-next does this: for any other architecture a 3-D tensor outside the experts
+                       is still refused.
 """
 from __future__ import annotations
 
@@ -84,21 +123,43 @@ FORM = {
     "ple_norm_query.weight": "F32", "ssm_a": "F32", "ssm_conv1d.weight": "F32", "ssm_dt.bias": "F32",
     "ssm_norm.weight": "F32",
 }
+# glm5-next (see the module docstring): every float tensor the engine reads from the pack, as F32.  An F16/BF16 one
+# in another quant of the model is widened exactly; a quantized one would need --compat-bf16 (dequantized to F32).
+# Everything quantized and not named here is served natively from the GGUF.
+FORM_GLM5_NEXT = {
+    "attn_norm.weight": "F32", "ffn_norm.weight": "F32", "output_norm.weight": "F32", "ssm_norm.weight": "F32",
+    "attn_q_a_norm.weight": "F32", "attn_kv_a_norm.weight": "F32",
+    "indexer.k_norm.weight": "F32", "indexer.k_norm.bias": "F32",
+    "hc_attn_base.weight": "F32", "hc_attn_scale.weight": "F32",
+    "hc_ffn_base.weight": "F32", "hc_ffn_scale.weight": "F32",
+    "ffn_gate_inp.weight": "F32", "exp_probs_b.bias": "F32",
+    "ssm_a": "F32", "ssm_dt.bias": "F32",
+    "ssm_conv1d_q.weight": "F32", "ssm_conv1d_k.weight": "F32", "ssm_conv1d_v.weight": "F32",
+    "indexer.proj.weight": "F32", "indexer_compressor_ape.weight": "F32",
+}
+# The table per general.architecture; any other architecture (qwen4exp and the files packed before GLM) takes FORM.
+FORMS = {"glm5-next": FORM_GLM5_NEXT}
 # PLE key encodings left in the GGUF for the engine's native PLE key (Q2_0; Q8_0 in UD-Q4_K_XL).  Other quantized
 # keys take the BF16 path (--compat-bf16), as before.
 NATIVE_PLE_KEY = {"Q2_0", "Q8_0"}
 KIND = {"BF16": "4", "F16": "5", "F32": "2"}
 
 
-def form_of(name: str):
-    return FORM.get(re.sub(r"^blk\.\d+\.", "", name))
+def form_of(name: str, form: dict | None = None):
+    return (FORM if form is None else form).get(re.sub(r"^blk\.\d+\.", "", name))
 
 
-def needs_bf16(name: str, type_name: str) -> bool:
+def layer_of(name: str):
+    """N of a `blk.N.` tensor, else None."""
+    m = re.match(r"blk\.(\d+)\.", name)
+    return int(m.group(1)) if m else None
+
+
+def needs_bf16(name: str, type_name: str, form: dict | None = None) -> bool:
     """Whether the engine reads `name` as BF16 from the pack (not natively from the GGUF)."""
     if name == "blk.1.ple_key.weight" and type_name in NATIVE_PLE_KEY:
         return False
-    return form_of(name) == "BF16"
+    return form_of(name, form) == "BF16"
 
 
 def dequantize(raw: np.ndarray, type_name: str) -> np.ndarray:
@@ -156,6 +217,15 @@ class Model:
         self.files = [G.GGUFFile(p) for p in paths]
         self.sizes = [p.stat().st_size for p in paths]
         check_split(self.files)
+        md = self.files[0].metadata
+        self.arch = str(md.get("general.architecture", ""))
+        self.form = FORMS.get(self.arch, FORM)
+        # the MTP block(s) at the end (glm5-next: blk.45), not packed until the drafter takes them (docstring)
+        n_block, n_mtp = int(md.get(self.arch + ".block_count", 0)), int(md.get(self.arch + ".nextn_predict_layers", 0))
+        self.excluded_layers = set(range(n_block - n_mtp, n_block)) if n_block and n_mtp else set()
+        # leading layers without experts (glm5-next: 3); None = every layer must have them, as before
+        lead = md.get(self.arch + ".leading_dense_block_count")
+        self.n_dense_lead = int(lead) if lead is not None else None
         self.where = {}
         for p, g in zip(paths, self.files):
             mm = np.memmap(p, dtype=np.uint8, mode="r")
@@ -170,6 +240,10 @@ class Model:
     def bytes(self, name) -> np.ndarray:
         g, t, mm, _ = self.where[name]
         return tensor_bytes(mm, g, t)
+
+    def excluded(self, name: str) -> bool:
+        """Left out of the pack entirely: the PLE table (read from its GGUF) and the MTP block(s)."""
+        return name in NOT_IN_PACK or layer_of(name) in self.excluded_layers
 
 
 def check_split(files) -> None:
@@ -223,10 +297,11 @@ def is_expert(name: str) -> bool:
     return name.startswith("blk.") and name.endswith(("_exps.weight",))
 
 
-def convert(name: str, type_name: str, raw: np.ndarray, compat_bf16: bool):
+def convert(name: str, type_name: str, raw: np.ndarray, compat_bf16: bool, table: dict | None = None):
     """The pack form of one tensor the engine reads from dense.bin: (kind, stored bytes, destination bytes,
-    record or None), or an error string.  `record` describes a conversion for conversions.json."""
-    form = form_of(name)
+    record or None), or an error string.  `record` describes a conversion for conversions.json.  `table`: the
+    architecture's form table (default: the Qwen FORM)."""
+    form = form_of(name, table)
     if form is None or form == type_name:
         return KIND[type_name], raw.tobytes(), raw.nbytes, None
     values = dequantize(raw, type_name)
@@ -276,14 +351,14 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False) -> int:
     reads them (FORM; converted when stored otherwise, see above), quantized ones served natively from the GGUF."""
     todo, problems = [], []
     for name, (g, t, mm, p) in model.where.items():
-        if is_expert(t.name) or t.name in NOT_IN_PACK:
+        if is_expert(t.name) or model.excluded(t.name):
             continue
-        if len(t.shape) > 2:
+        if len(t.shape) > 2 and model.form is not FORM_GLM5_NEXT:
             print("tensor %s has %d dimensions; the index holds two" % (t.name, len(t.shape)))
             return 1
         # quantized: served from the GGUF unless the engine reads it from the pack (FORM), which takes
         # --compat-bf16 to dequantize - except the native PLE key encodings
-        form = form_of(name)
+        form = form_of(name, model.form)
         native = t.type_name not in FLOAT and (form is None or (
             name == "blk.1.ple_key.weight" and t.type_name in NATIVE_PLE_KEY))
         if t.type_name not in FLOAT and not native and not compat_bf16:
@@ -302,14 +377,14 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False) -> int:
     with open(out / "dense.bin.tmp", "wb") as fo:
         for name, g, t, mm, p, native in todo:
             ne0 = int(t.shape[0])
-            ne1 = int(t.shape[1]) if len(t.shape) > 1 else 0
+            ne1 = int(np.prod(t.shape[1:], dtype=np.int64)) if len(t.shape) > 1 else 0   # 3-D: rows (glm5-next)
             if native:
                 served += 1
                 rows.append([t.name, "0", "0", "0", "0", "0", "0", str(ne0), str(ne1), "8", "0", "32"] + ["0"] * 7)
                 continue
             raw = tensor_bytes(mm, g, t)
             try:
-                got = convert(name, t.type_name, raw, compat_bf16)
+                got = convert(name, t.type_name, raw, compat_bf16, model.form)
             except ValueError as e:
                 got = str(e)
             if isinstance(got, str):
@@ -431,16 +506,32 @@ def expert_layout(model: Model, src: pathlib.Path):
     Each role is resolved by name in whichever shard holds it, and its offset is absolute in THAT shard: two
     shards do not start their data section at the same byte, so one role's data_start must not be used for
     another's (per-role data_start as in #255, gopinath87607)."""
-    T = {n: w[1] for n, w in model.where.items()}
+    T = {n: w[1] for n, w in model.where.items() if not model.excluded(n)}
     exps = [n for n in T if n.startswith("blk.") and n.endswith("_exps.weight")]
     if not exps:
         return "the model has no expert tensors (blk.N.ffn_{gate,up,down}_exps.weight)"
     n_layers = 1 + max(int(n.split(".")[1]) for n in exps)
-    n_expert = int(T["blk.0.ffn_gate_inp.weight"].shape[1])   # router rows = experts kept (pruned models ship < 512)
-    if any(int(T["blk.%d.ffn_gate_inp.weight" % l].shape[1]) != n_expert for l in range(n_layers)):
+    # layers without experts (glm5-next's leading dense layers) get no line; every other layer needs all three
+    # roles and a router, as before
+    dense = set()
+    for l in range(n_layers):
+        names = ["blk.%d.ffn_%s_exps.weight" % (l, r) for r in ROLES]
+        if model.n_dense_lead is not None and not any(n in T for n in names):
+            if "blk.%d.ffn_gate_inp.weight" % l in T:
+                return "layer %d has a router but no experts" % l
+            dense.add(l)
+    if model.n_dense_lead is not None and dense != set(range(model.n_dense_lead)):
+        return "layers %s have no experts, but %s.leading_dense_block_count is %d" % (
+            sorted(dense), model.arch, model.n_dense_lead)
+    moe = [l for l in range(n_layers) if l not in dense]
+    for l in moe:
+        if "blk.%d.ffn_gate_inp.weight" % l not in T:
+            return "layer %d: missing blk.%d.ffn_gate_inp.weight (the router)" % (l, l)
+    n_expert = int(T["blk.%d.ffn_gate_inp.weight" % moe[0]].shape[1])   # router rows = experts kept (pruned models ship < 512)
+    if any(int(T["blk.%d.ffn_gate_inp.weight" % l].shape[1]) != n_expert for l in moe):
         return "the routers disagree on the expert count; a per-layer pruned model cannot be packed"
     layout, lines, offset, n_split = [], [], 0, 0
-    for l in range(n_layers):
+    for l in moe:
         names = ["blk.%d.ffn_%s_exps.weight" % (l, r) for r in ROLES]
         if any(n not in T for n in names):
             return "layer %d: missing %s" % (l, ", ".join(n for n in names if n not in T))
@@ -465,7 +556,7 @@ def expert_layout(model: Model, src: pathlib.Path):
                 "[shard | gate,up,down] (n_expert %d, total %d; absolute offsets in %s, or in the named shard "
                 "beside it - per role where the column is gate,up,down)\n" % (n_expert, offset, src.name))
         print("%d layer(s) have their gate/up/down in different shards: native_experts.txt v4, per-role shard "
-              "column for %s" % (n_split, ", ".join(str(l) for l, *_ in layout if "," in lines[l])))
+              "column for %s" % (n_split, ", ".join(str(row[0]) for row, line in zip(layout, lines) if "," in line)))
     else:
         head = ("# strata native experts v3: layer gu_type d_type offset blob_bytes gate_off up_off down_off [shard] "
                 "(n_expert %d, total %d; absolute offsets in %s, or in the named shard beside it)\n"
@@ -553,6 +644,9 @@ def main() -> int:
         print("warning: %s has no %s, so nothing says it belongs to this model; the engine reads it instead of "
               "the GGUF (rerun with --experts-bin to rewrite it)" % (path, sidecar.name))
     if a.base:
+        if model.form is not FORM:
+            print("--base shares a Qwen Q2_0 pack's dense.bin; a %s model packs standalone" % model.arch)
+            return 1
         if any(w[3] != src for w in model.where.values() if not w[1].name in NOT_IN_PACK):
             print("--base needs a model whose tensors are all in shard 1")
             return 1

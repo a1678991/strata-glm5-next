@@ -524,5 +524,133 @@ class SplitArtifactTests(unittest.TestCase):
             self.assertEqual((pack / "experts.bin").read_bytes(), want)
 
 
+
+# ---- glm5-next in miniature: 4 blocks, block 0 dense (leading_dense_block_count 1), blocks 1-2 MoE with 4 experts,
+# block 3 the MTP layer (nextn_predict_layers 1).  The shapes are small; the names and the kinds of tensor are GLM's.
+def glm_model(root, dense_router=False, lead=1, drop=None):
+    path = root / "glm-00001-of-00001.gguf"
+    writer = GGUFWriter(path, "glm5-next")
+    writer.add_uint32("glm5-next.block_count", 4)
+    writer.add_uint32("glm5-next.nextn_predict_layers", 1)
+    writer.add_uint32("glm5-next.leading_dense_block_count", lead)
+    rng = np.random.default_rng(7)
+    f32 = lambda *shape: rng.standard_normal(shape).astype(np.float32)
+    t = [("token_embd.weight", f32(64, 32), Q.Q8_0), ("output.weight", f32(64, 32), Q.Q8_0),
+         ("output_norm.weight", f32(32), Q.F32)]
+    for l in range(4):
+        t += [(f"blk.{l}.attn_norm.weight", f32(32), Q.F32), (f"blk.{l}.ffn_norm.weight", f32(32), Q.F32),
+              (f"blk.{l}.hc_attn_fn.weight", f32(24, 128), Q.Q8_0), (f"blk.{l}.hc_attn_base.weight", f32(24), Q.F32),
+              (f"blk.{l}.attn_q.weight", f32(64, 32), Q.Q8_0),
+              (f"blk.{l}.ssm_conv1d_q.weight", f32(64, 1, 4), Q.F32),           # GGUF [4, 1, 64]
+              (f"blk.{l}.attn_k_b.weight", f32(4, 32, 32), Q.Q8_0)]              # GGUF [32, 32, 4]
+        if l == 0:
+            t += [(f"blk.0.ffn_{r}.weight", f32(64, 32), Q.Q8_0) for r in ("gate", "up", "down")]
+            if dense_router:
+                t.append(("blk.0.ffn_gate_inp.weight", f32(N_EXPERT, 32), Q.F32))
+        else:
+            t += [(f"blk.{l}.ffn_gate_inp.weight", f32(N_EXPERT, 32), Q.F32),
+                  (f"blk.{l}.exp_probs_b.bias", f32(N_EXPERT), Q.F32),
+                  (f"blk.{l}.ffn_gate_shexp.weight", f32(32, 32), Q.Q8_0)]
+            t += [(f"blk.{l}.ffn_{r}_exps.weight", expert(30 + 3 * l + i, (32, 32)), Q.Q8_0)
+                  for i, r in enumerate(("gate", "up", "down"))]
+    t.append(("blk.3.nextn.eh_proj.weight", f32(32, 64), Q.Q8_0))
+    for name, values, kind in t:
+        if name != drop:
+            writer.add_tensor(name, quants.quantize(values, kind), raw_dtype=kind)
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+    return path
+
+
+class Glm5NextTests(unittest.TestCase):
+    def test_dense_layers_mtp_layer_and_the_glm_form(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            src = glm_model(root)
+            rc, log = run_pack(src, root / "pack", "--compat-bf16")
+            self.assertEqual(rc, 0, log)
+            head, *lines = (root / "pack" / "native_experts.txt").read_text().splitlines()
+            # the format is v3 as for Qwen; only the MoE layers have a line, the MTP layer none
+            self.assertTrue(head.startswith("# strata native experts v3: layer gu_type d_type offset blob_bytes "
+                                            "gate_off up_off down_off [shard] (n_expert 4, total "), head)
+            self.assertEqual([f.split()[0] for f in lines], ["1", "2"])
+            blob = 3 * 32 * 32 // 32 * 34
+            self.assertEqual([int(f.split()[3]) for f in lines], [0, blob * N_EXPERT])   # contiguous from 0
+            self.assertIn("total %d;" % (2 * blob * N_EXPERT), head)
+            m = iq_pack.Model(src)
+            for f in lines:
+                l = int(f.split()[0])
+                for r, role in enumerate(("gate", "up", "down")):
+                    g, t, _, _ = m.where[f"blk.{l}.ffn_{role}_exps.weight"]
+                    self.assertEqual(int(f.split()[5 + r]), g.data_start + t.offset)
+            _, rows = iq_pack.read_index(root / "pack" / "index.txt")
+            self.assertFalse([n for n in rows if n.startswith("blk.3.")])           # the MTP layer is left out
+            self.assertFalse([n for n in rows if n.endswith("_exps.weight")])
+            for name in ["blk.1.ffn_gate_inp.weight", "blk.1.exp_probs_b.bias", "blk.0.attn_norm.weight",
+                         "blk.0.hc_attn_base.weight", "output_norm.weight", "blk.0.ssm_conv1d_q.weight"]:
+                self.assertEqual(rows[name][2], "2", name)                          # F32, as stored, in dense.bin
+            for name in ["blk.0.ffn_gate.weight", "blk.1.ffn_gate_shexp.weight", "blk.0.hc_attn_fn.weight",
+                         "blk.0.attn_q.weight", "blk.0.attn_k_b.weight", "token_embd.weight", "output.weight"]:
+                self.assertEqual(rows[name][2:5], ["0", "0", "0"], name)            # native: shape only
+            self.assertEqual(rows["blk.0.ssm_conv1d_q.weight"][7:9], ["4", "64"])   # [4, 1, 64] -> [4, 64]
+            self.assertEqual(rows["blk.0.attn_k_b.weight"][7:9], ["32", "128"])     # [32, 32, 4] -> [32, 128]
+            # nothing rounded, though --compat-bf16 was given: GLM keeps every tensor in the GGUF's encoding
+            self.assertEqual(json.loads((root / "pack" / "compat-bf16.json").read_text())["tensors"], [])
+            self.assertEqual(json.loads((root / "pack" / "conversions.json").read_text())["tensors"], [])
+            dense = (root / "pack" / "dense.bin").read_bytes()
+            off, size = int(rows["blk.1.ffn_gate_inp.weight"][3]), int(rows["blk.1.ffn_gate_inp.weight"][4])
+            self.assertEqual(dense[off:off + size], m.bytes("blk.1.ffn_gate_inp.weight").tobytes())
+
+    def test_experts_bin_skips_the_dense_layers(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            src = glm_model(root)
+            rc, log = run_pack(src, root / "pack", "--experts-bin")
+            self.assertEqual(rc, 0, log)
+            m = iq_pack.Model(src)
+            want = b"".join(np.concatenate([m.bytes(f"blk.{l}.ffn_{r}_exps.weight").reshape(N_EXPERT, -1)
+                                            for r in ("gate", "up", "down")], axis=1).tobytes() for l in (1, 2))
+            self.assertEqual((root / "pack" / "experts.bin").read_bytes(), want)
+
+    def test_a_dense_layer_with_a_router_is_refused(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            rc, log = run_pack(glm_model(root, dense_router=True), root / "pack")
+            self.assertEqual(rc, 1)
+            self.assertIn("layer 0 has a router but no experts", log)
+
+    def test_dense_layers_must_be_the_declared_leading_ones(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            rc, log = run_pack(glm_model(root, lead=2), root / "pack")
+            self.assertEqual(rc, 1)
+            self.assertIn("leading_dense_block_count is 2", log)
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)                                   # layer 2 loses its experts: not a leading layer
+            rc, log = run_pack(glm_model(root, drop="blk.2.ffn_up_exps.weight"), root / "pack")
+            self.assertEqual(rc, 1)
+            self.assertIn("layer 2: missing blk.2.ffn_up_exps.weight", log)
+
+    def test_every_glm_float_tensor_has_a_form(self):
+        # the F32 tensors of GLM-5.3-Flash UD-IQ4_XS's header (research/gguf/glm_header.json), MTP layer aside
+        f32 = ["attn_norm.weight", "ffn_norm.weight", "output_norm.weight", "ssm_norm.weight", "attn_q_a_norm.weight",
+               "attn_kv_a_norm.weight", "indexer.k_norm.weight", "indexer.k_norm.bias", "hc_attn_base.weight",
+               "hc_attn_scale.weight", "hc_ffn_base.weight", "hc_ffn_scale.weight", "ffn_gate_inp.weight",
+               "exp_probs_b.bias", "ssm_a", "ssm_dt.bias", "ssm_conv1d_q.weight", "ssm_conv1d_k.weight",
+               "ssm_conv1d_v.weight", "indexer.proj.weight", "indexer_compressor_ape.weight"]
+        self.assertEqual(sorted(f32), sorted(iq_pack.FORM_GLM5_NEXT))
+        self.assertTrue(all(v == "F32" for v in iq_pack.FORM_GLM5_NEXT.values()))
+
+    def test_qwen_still_refuses_a_3d_tensor_outside_the_experts(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            source = root / "model.gguf"
+            write_gguf(source, [("blk.0.attn_k_b.weight", np.ones((4, 32, 32), np.float32), Q.Q8_0)])
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(iq_pack.index_standalone(source, root, iq_pack.Model(source)), 1)
+            self.assertIn("has 3 dimensions", out.getvalue())
+
 if __name__ == "__main__":
     unittest.main()
