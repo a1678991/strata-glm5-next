@@ -71,26 +71,55 @@ EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false":
           "low": "low", "medium": "medium", "high": "xhigh", "xhigh": "xhigh", "max": "xhigh", "maximum": "xhigh"}
 
 
-def effort_kwargs(value) -> dict:
-    """A reasoning effort as given by a client -> the template's kwargs.  Unknown values are a 400, not a crash."""
+# GLM-5.3-Flash's template (glm_chat_template.jinja) takes reasoning_effort "low" or "high" and renders anything else,
+# unset included, as "Reasoning Effort: Max"; it has no enable_thinking (the server closes the thinking block itself,
+# Service.render_prompt).  Clients' spellings map onto those three levels and off:
+#   none/off/minimal/disabled/false -> thinking off;  low -> Low;  medium -> High;  high -> High;
+#   xhigh/max/maximum (and no effort at all) -> Max.
+# "high" stays High (not Max, as Qwen's high is its top level): GLM has a level above it, which "max" names.
+GLM_EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false": None,
+              "low": "low", "medium": "high", "high": "high", "xhigh": "max", "max": "max", "maximum": "max"}
+
+
+@dataclass(frozen=True)
+class Efforts:
+    """One model family's thinking levels: the client spelling -> the template's level (None: thinking off), the
+    levels Anthropic's budget_tokens maps to (under 2K, under 8K, more), the levels the template renders as its
+    default (Service.render_prompt's #458 effort-at-the-end keeps those at the top), and the 400's hint."""
+    table: dict
+    budget: tuple
+    default: tuple
+    hint: str
+
+
+QWEN_EFFORTS = Efforts(EFFORT, ("low", "medium", "xhigh"), (None, "", "xhigh", "high"), "none, low, medium or high")
+GLM_EFFORTS = Efforts(GLM_EFFORT, ("low", "high", "max"), (None, "", "max"), "none, low, medium, high or max")
+
+
+def effort_kwargs(value, efforts: Efforts | None = None) -> dict:
+    """A reasoning effort as given by a client -> the template's kwargs.  Unknown values are a 400, not a crash.
+    `efforts`: the model family's levels (default: Qwen's)."""
+    efforts = efforts or QWEN_EFFORTS
     if value is None or value == "":
         return {}
     if value is False:
         return {"enable_thinking": False}
     key = str(value).strip().lower()
-    if key not in EFFORT:
-        raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium or high")
-    level = EFFORT[key]
+    if key not in efforts.table:
+        raise ValueError(f"unknown reasoning effort {value!r}: use {efforts.hint}")
+    level = efforts.table[key]
     return {"enable_thinking": False} if level is None else {"reasoning_effort": level}
 
 
-def budget_effort(tokens) -> dict:
-    """Anthropic's thinking budget (budget_tokens) -> a level: under 2K low, under 8K medium, else high."""
+def budget_effort(tokens, efforts: Efforts | None = None) -> dict:
+    """Anthropic's thinking budget (budget_tokens) -> a level: under 2K low, under 8K medium, else high (Qwen: low,
+    medium, xhigh; GLM: low, high, max)."""
+    lo, mid, hi = (efforts or QWEN_EFFORTS).budget
     try:
         n = int(tokens)
     except (TypeError, ValueError):
         return {}
-    return {"reasoning_effort": "low" if n < 2048 else "medium" if n < 8192 else "xhigh"}
+    return {"reasoning_effort": lo if n < 2048 else mid if n < 8192 else hi}
 
 
 def _has_image(content) -> bool:
@@ -257,8 +286,9 @@ def _tool_list(value, wrapper: str | None) -> list[dict]:
     return tools
 
 
-def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
-    """OpenAI Chat Completions -> (template messages, template tools, template kwargs)."""
+def openai_to_messages(req: dict, efforts: Efforts | None = None) -> tuple[list[dict], list[dict] | None, dict]:
+    """OpenAI Chat Completions -> (template messages, template tools, template kwargs).  `efforts`: the model
+    family's thinking levels (default: Qwen's)."""
     messages = []
     for m in _object_list(req.get("messages"), "messages"):
         role = m.get("role")
@@ -284,20 +314,22 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
     kwargs = {}
     # OpenAI Chat Completions: "reasoning_effort"; Responses style: "reasoning": {"effort": ...}
     reasoning = req.get("reasoning") if isinstance(req.get("reasoning"), dict) else {}
-    kwargs.update(effort_kwargs(req.get("reasoning_effort") or reasoning.get("effort")))
+    kwargs.update(effort_kwargs(req.get("reasoning_effort") or reasoning.get("effort"), efforts))
     # the vLLM / llama.cpp convention: {"chat_template_kwargs": {"enable_thinking": false, "reasoning_effort": "low"}}
     for k, v in (req.get("chat_template_kwargs") or {}).items():
         if k == "enable_thinking" and not v:
             kwargs = {"enable_thinking": False}
         elif k == "reasoning_effort" and "enable_thinking" not in kwargs:
-            kwargs.update(effort_kwargs(v))
+            kwargs.update(effort_kwargs(v, efforts))
     return _late_system_to_user(messages), tools, kwargs
 
 
-def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[dict], list[dict] | None, dict]:
+def anthropic_to_messages(req: dict, think_unasked: bool = True,
+                          efforts: Efforts | None = None) -> tuple[list[dict], list[dict] | None, dict]:
     """Anthropic Messages -> (template messages, template tools, template kwargs).  `think_unasked`: a request
     without "thinking", an effort or a budget gets the template's default (it thinks), as through 0.1.31; False
-    renders it without thinking (#278, the config's "anthropic_thinking": "on_request")."""
+    renders it without thinking (#278, the config's "anthropic_thinking": "on_request").  `efforts`: the model
+    family's thinking levels (default: Qwen's)."""
     messages = []
     system = req.get("system")
     if system:
@@ -339,9 +371,9 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
     if isinstance(thinking, dict) and thinking.get("type") == "disabled":
         kwargs["enable_thinking"] = False
     elif effort:
-        kwargs.update(effort_kwargs(effort))
+        kwargs.update(effort_kwargs(effort, efforts))
     elif isinstance(thinking, dict) and thinking.get("budget_tokens"):
-        kwargs.update(budget_effort(thinking["budget_tokens"]))
+        kwargs.update(budget_effort(thinking["budget_tokens"], efforts))
     elif thinking is None and not req.get("reasoning_budget_tokens") and not think_unasked:
         # Opt-in (the config's "anthropic_thinking": "on_request"; the default thinks as 0.1.31 did, since a
         # client that never asks would otherwise lose the thinking on every turn).  Anthropic's thinking is
@@ -485,8 +517,17 @@ class OutputParser:
         self.sval_started = False
         self.sdeclared = {}
 
-    def _scan(self) -> list[Event]:
-        """Advance the streaming view of the call body in self.buf (see stream_tools)."""
+    def _call_end(self, text: str) -> int:
+        """Where the call body in `text` ends (its </tool_call>), -1: not yet."""
+        return call_end(text)
+
+    def _parse_call(self, body: str) -> ToolCall:
+        name = body.strip()[len("<function="):].split(">", 1)[0]
+        return parse_tool_call(body, self.schemas.get(name))
+
+    def _scan(self, final: bool = False) -> list[Event]:
+        """Advance the streaming view of the call body in self.buf (see stream_tools).  `final`: self.buf is the whole
+        body (its </tool_call> has arrived); the Qwen grammar does not need to know."""
         out = []
 
         def args(s):
@@ -636,11 +677,11 @@ class OutputParser:
                 self.buf = self.buf[i + len(CALL_START):]
                 self.state = "call"
             else:
-                i = call_end(self.buf)
+                i = self._call_end(self.buf)
                 if self.stream_tools:
                     if i >= 0:
                         whole, self.buf = self.buf, self.buf[:i]     # scan only the body
-                        out += self._scan()
+                        out += self._scan(final=True)
                         out += self._close_scan()
                         self.buf = whole
                     else:
@@ -649,8 +690,7 @@ class OutputParser:
                     return out
                 body = self.buf[:i]
                 self.buf = self.buf[i + len(CALL_END):]
-                name = body.strip()[len("<function="):].split(">", 1)[0]
-                call = parse_tool_call(body, self.schemas.get(name))
+                call = self._parse_call(body)
                 if self.scall is not None:
                     call.id = self.scall.id
                 out.append(Event("tool_call", call=call))
@@ -674,3 +714,227 @@ class OutputParser:
             out.append(Event(kind, text))
             self.buf = ""
         return out
+
+
+# ------------------------------------------------------------------------------------------------ GLM tool calls
+# GLM-5.3-Flash (glm_chat_template.jinja) writes a call as
+#     <tool_call>NAME<arg_key>K1</arg_key><arg_value>V1</arg_value><arg_key>K2</arg_key>...</tool_call>
+# (GLM-4.6 put newlines between the parts; they are accepted), with string values as they are and every other value as
+# JSON (the template's `tojson`).  The reasoning tags are Qwen's (<think>, </think>), so OutputParser's reasoning and
+# content states are shared; only the call body differs.
+ARG_KEY, ARG_KEY_END = "<arg_key>", "</arg_key>"
+ARG_VALUE, ARG_VALUE_END = "<arg_value>", "</arg_value>"
+
+
+def glm_value_end(text: str, final: bool = False) -> int:
+    """Where an argument value in `text` ends: the first `</arg_value>` followed (after whitespace) by the next
+    `<arg_key>` or the `</tool_call>` - the same text inside a value (a file that documents the call format, #210)
+    is part of the value.  -1: none yet; -2: a candidate whose follower has not arrived (`final` accepts it)."""
+    at = text.find(ARG_VALUE_END)
+    while at >= 0:
+        after = text[at + len(ARG_VALUE_END):].lstrip()
+        if after.startswith((ARG_KEY, CALL_END)):
+            return at
+        if not after or ARG_KEY.startswith(after) or CALL_END.startswith(after):
+            return at if final else -2
+        at = text.find(ARG_VALUE_END, at + 1)
+    return -1
+
+
+def glm_call_end(text: str) -> int:
+    """Where a GLM tool call's body ends: the `</tool_call>` after its last argument, found by walking the arguments
+    with glm_value_end, so a value may contain either tag.  -1: not complete yet.  A body that is not in the call
+    format ends at the first `</tool_call>`, as OutputParser's does."""
+    a, b = text.find(ARG_KEY), text.find(CALL_END)
+    if a < 0 or 0 <= b < a:                          # no arguments (or not yet)
+        return b
+    pos = a
+    while True:
+        rest = text[pos:]
+        s = rest.lstrip()
+        pos += len(rest) - len(s)
+        if s.startswith(ARG_KEY):
+            ke = text.find(ARG_KEY_END, pos)
+            if ke < 0:
+                return -1
+            pos = ke + len(ARG_KEY_END)
+            rest = text[pos:]
+            s = rest.lstrip()
+            pos += len(rest) - len(s)
+            if not s or ARG_VALUE.startswith(s):
+                return -1
+            if not s.startswith(ARG_VALUE):
+                return text.find(CALL_END, pos)
+            pos += len(ARG_VALUE)
+            end = glm_value_end(text[pos:])
+            if end < 0:
+                return -1
+            pos += end + len(ARG_VALUE_END)
+        elif s.startswith(CALL_END):
+            return pos
+        elif not s or ARG_KEY.startswith(s) or CALL_END.startswith(s):
+            return -1
+        else:
+            return text.find(CALL_END, pos)
+
+
+_GLM_NAME = re.compile(r"[^\s<>{}\"']+")
+
+
+def _glm_name(text: str) -> str | None:
+    """The tool name before the first <arg_key> (or the whole body): one word without tags, braces or quotes - a JSON
+    body or stray text is not a GLM call."""
+    name = text.strip()
+    return name if _GLM_NAME.fullmatch(name) else None
+
+
+def _glm_value(value: str, declared):
+    """A value as the template wrote it: a string parameter as it is, anything else JSON-decoded when it parses (a
+    string that is not JSON stays a string, as in parse_tool_call and llama.cpp's GLM parser)."""
+    if declared == "string":
+        return value
+    try:
+        return json.loads(value)
+    except ValueError:
+        return value
+
+
+def parse_glm_tool_call(body: str, schema: dict | None = None) -> ToolCall:
+    """`NAME<arg_key>K</arg_key><arg_value>V</arg_value>...` (the text between <tool_call> and </tool_call>) ->
+    ToolCall.  Values are JSON-decoded when the tool's schema says the parameter is not a string (or, without a
+    schema, whenever they parse as JSON)."""
+    a = body.find(ARG_KEY)
+    name = _glm_name(body if a < 0 else body[:a])
+    if name is None:
+        raise ValueError("malformed tool call: " + body[:80])
+    props = ((schema or {}).get("parameters") or {}).get("properties") or {}
+    args = {}
+    rest = body[a:] if a >= 0 else ""
+    while ARG_KEY in rest:
+        rest = rest[rest.index(ARG_KEY) + len(ARG_KEY):]
+        ke = rest.find(ARG_KEY_END)
+        if ke < 0:
+            break
+        key = rest[:ke].strip()
+        rest = rest[ke + len(ARG_KEY_END):]
+        vs = rest.find(ARG_VALUE)
+        if vs < 0 or rest[:vs].strip():
+            break
+        rest = rest[vs + len(ARG_VALUE):]
+        end = glm_value_end(rest, final=True)
+        value = rest[:end] if end >= 0 else rest
+        rest = rest[end + len(ARG_VALUE_END):] if end >= 0 else ""
+        args[key] = _glm_value(value, (props.get(key) or {}).get("type"))
+    return ToolCall(name=name, arguments=args)
+
+
+class GlmOutputParser(OutputParser):
+    """OutputParser for GLM-5.3-Flash's tool-call grammar (above).  Streams like OutputParser: "tool_start" once the
+    name is complete (at its first <arg_key>, or the </tool_call> of a call without arguments), "tool_args" pieces
+    whose concatenation is the arguments' JSON (string values character by character, others whole), then
+    "tool_call"."""
+
+    def _call_end(self, text: str) -> int:
+        return glm_call_end(text)
+
+    def _parse_call(self, body: str) -> ToolCall:
+        a = body.find(ARG_KEY)
+        return parse_glm_tool_call(body, self.schemas.get(_glm_name(body if a < 0 else body[:a])))
+
+    def _scan(self, final: bool = False) -> list[Event]:
+        out = []
+
+        def args(s):
+            if s:
+                out.append(Event("tool_args", s, call=self.scall))
+        while True:
+            rest = self.buf[self.sp:]
+            if self.ss == "name":
+                a = rest.find(ARG_KEY)
+                if a < 0 and not final:
+                    return out
+                name = _glm_name(rest if a < 0 else rest[:a])
+                if name is None:
+                    return out                  # not a call this parser can stream: the final parse decides
+                self.scall = ToolCall(name=name, arguments={})
+                props = ((self.schemas.get(name) or {}).get("parameters") or {}).get("properties") or {}
+                self.sdeclared = {k: (v or {}).get("type") for k, v in props.items()}
+                out.append(Event("tool_start", call=self.scall))
+                args("{")
+                self.sp += len(rest) if a < 0 else a
+                self.ss = "between"
+            elif self.ss == "between":
+                stripped = rest.lstrip()
+                self.sp += len(rest) - len(stripped)
+                if stripped.startswith(ARG_KEY):
+                    ke = stripped.find(ARG_KEY_END)
+                    if ke < 0:
+                        return out
+                    after = stripped[ke + len(ARG_KEY_END):]
+                    value = after.lstrip()
+                    if not value.startswith(ARG_VALUE):
+                        return out          # <arg_value> still arriving (or not in the format: the final parse)
+                    key = stripped[len(ARG_KEY):ke].strip()
+                    args(("" if self.sfirst else ",") + json.dumps(key) + ":")
+                    self.sfirst = False
+                    self.sp += ke + len(ARG_KEY_END) + len(after) - len(value) + len(ARG_VALUE)
+                    if self.sdeclared.get(key) == "string":
+                        args('"')
+                        self.ss = "str"
+                    else:
+                        self.ss = "raw"
+                elif final and not stripped:
+                    args("}")
+                    self.ss = "done"
+                else:
+                    return out          # a tag still arriving (or trailing text): wait
+            elif self.ss == "str":
+                end = glm_value_end(rest, final)
+                if end >= 0:
+                    args(json.dumps(rest[:end])[1:-1] + '"')
+                    self.sp += end + len(ARG_VALUE_END)
+                    self.ss = "between"
+                    continue
+                # an undecided </arg_value> (-2) is held from its start, like a tag still arriving
+                safe = rest.find(ARG_VALUE_END) if end == -2 else len(rest) - self._hold(rest, (ARG_VALUE_END,))
+                if safe > 0:
+                    args(json.dumps(rest[:safe])[1:-1])
+                    self.sp += safe
+                return out
+            elif self.ss == "raw":
+                end = glm_value_end(rest, final)
+                if end < 0:
+                    return out
+                args(json.dumps(_glm_value(rest[:end], None), ensure_ascii=False))
+                self.sp += end + len(ARG_VALUE_END)
+                self.ss = "between"
+            else:
+                return out
+
+    def _close_scan(self) -> list[Event]:
+        out = []
+        if self.scall is None or self.ss == "done":
+            return out
+        tail = ""
+        if self.ss == "str":
+            tail += '"'
+        elif self.ss == "raw":
+            tail += json.dumps(self.buf[self.sp:])
+        tail += "}"
+        out.append(Event("tool_args", tail, call=self.scall))
+        self.ss = "done"
+        return out
+
+    def finish(self) -> list[Event]:
+        """As OutputParser.finish; a call that was announced and whose last value is complete (only its </tool_call>
+        is missing) is a whole call, with its arguments."""
+        if self.state == "call" and self.stream_tools and self.scall is not None:
+            out = self._scan(final=True)
+            if self.ss == "done":
+                call = self._parse_call(self.buf)
+                call.id = self.scall.id
+                out.append(Event("tool_call", call=call))
+            self.buf = ""
+            self._reset_scan()
+            return out
+        return super().finish()

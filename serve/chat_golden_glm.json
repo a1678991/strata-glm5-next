@@ -1,0 +1,635 @@
+[
+ {
+  "name": "single user",
+  "api": "openai",
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hello"
+    }
+   ]
+  },
+  "kwargs": {},
+  "thinking": true,
+  "rendered": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Hello<|assistant|><think>"
+ },
+ {
+  "name": "system + user",
+  "api": "openai",
+  "request": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "Hello"
+    }
+   ]
+  },
+  "kwargs": {},
+  "thinking": true,
+  "rendered": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>You are terse.<|user|>Hello<|assistant|><think>"
+ },
+ {
+  "name": "multi-turn with reasoning",
+  "api": "openai",
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hello"
+    },
+    {
+     "role": "assistant",
+     "content": "Hi there.",
+     "reasoning_content": "Greet back."
+    },
+    {
+     "role": "user",
+     "content": "And now?"
+    }
+   ]
+  },
+  "kwargs": {},
+  "thinking": true,
+  "rendered": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Hello<|assistant|><think>Greet back.</think>Hi there.<|user|>And now?<|assistant|><think>"
+ },
+ {
+  "name": "multi-turn, reasoning inline in content",
+  "api": "openai",
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hello"
+    },
+    {
+     "role": "assistant",
+     "content": "<think>Greet back.</think>Hi there."
+    },
+    {
+     "role": "user",
+     "content": "And now?"
+    }
+   ]
+  },
+  "kwargs": {},
+  "thinking": true,
+  "rendered": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Hello<|assistant|><think>Greet back.</think>Hi there.<|user|>And now?<|assistant|><think>"
+ },
+ {
+  "name": "effort low",
+  "api": "openai",
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hello"
+    }
+   ],
+   "reasoning_effort": "low"
+  },
+  "kwargs": {
+   "reasoning_effort": "low"
+  },
+  "thinking": true,
+  "rendered": "[gMASK]<sop><|system|>Reasoning Effort: Low<|user|>Hello<|assistant|><think>"
+ },
+ {
+  "name": "effort medium",
+  "api": "openai",
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hello"
+    }
+   ],
+   "reasoning_effort": "medium"
+  },
+  "kwargs": {
+   "reasoning_effort": "high"
+  },
+  "thinking": true,
+  "rendered": "[gMASK]<sop><|system|>Reasoning Effort: High<|user|>Hello<|assistant|><think>"
+ },
+ {
+  "name": "effort high",
+  "api": "openai",
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hello"
+    }
+   ],
+   "reasoning_effort": "high"
+  },
+  "kwargs": {
+   "reasoning_effort": "high"
+  },
+  "thinking": true,
+  "rendered": "[gMASK]<sop><|system|>Reasoning Effort: High<|user|>Hello<|assistant|><think>"
+ },
+ {
+  "name": "effort xhigh",
+  "api": "openai",
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hello"
+    }
+   ],
+   "reasoning_effort": "xhigh"
+  },
+  "kwargs": {
+   "reasoning_effort": "max"
+  },
+  "thinking": true,
+  "rendered": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Hello<|assistant|><think>"
+ },
+ {
+  "name": "effort max",
+  "api": "openai",
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hello"
+    }
+   ],
+   "reasoning_effort": "max"
+  },
+  "kwargs": {
+   "reasoning_effort": "max"
+  },
+  "thinking": true,
+  "rendered": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Hello<|assistant|><think>"
+ },
+ {
+  "name": "effort none (thinking off)",
+  "api": "openai",
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hello"
+    }
+   ],
+   "reasoning_effort": "none"
+  },
+  "kwargs": {
+   "enable_thinking": false
+  },
+  "thinking": false,
+  "rendered": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Hello<|assistant|><think></think>"
+ },
+ {
+  "name": "chat_template_kwargs enable_thinking false",
+  "api": "openai",
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hello"
+    }
+   ],
+   "chat_template_kwargs": {
+    "enable_thinking": false
+   }
+  },
+  "kwargs": {
+   "enable_thinking": false
+  },
+  "thinking": false,
+  "rendered": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Hello<|assistant|><think></think>"
+ },
+ {
+  "name": "responses-style reasoning.effort low",
+  "api": "openai",
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hello"
+    }
+   ],
+   "reasoning": {
+    "effort": "low"
+   }
+  },
+  "kwargs": {
+   "reasoning_effort": "low"
+  },
+  "thinking": true,
+  "rendered": "[gMASK]<sop><|system|>Reasoning Effort: Low<|user|>Hello<|assistant|><think>"
+ },
+ {
+  "name": "anthropic thinking disabled",
+  "api": "anthropic",
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hello"
+    }
+   ],
+   "thinking": {
+    "type": "disabled"
+   }
+  },
+  "kwargs": {
+   "enable_thinking": false
+  },
+  "thinking": false,
+  "rendered": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Hello<|assistant|><think></think>"
+ },
+ {
+  "name": "anthropic budget 1024 (low)",
+  "api": "anthropic",
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hello"
+    }
+   ],
+   "thinking": {
+    "type": "enabled",
+    "budget_tokens": 1024
+   }
+  },
+  "kwargs": {
+   "reasoning_effort": "low"
+  },
+  "thinking": true,
+  "rendered": "[gMASK]<sop><|system|>Reasoning Effort: Low<|user|>Hello<|assistant|><think>"
+ },
+ {
+  "name": "anthropic budget 4096 (high)",
+  "api": "anthropic",
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hello"
+    }
+   ],
+   "thinking": {
+    "type": "enabled",
+    "budget_tokens": 4096
+   }
+  },
+  "kwargs": {
+   "reasoning_effort": "high"
+  },
+  "thinking": true,
+  "rendered": "[gMASK]<sop><|system|>Reasoning Effort: High<|user|>Hello<|assistant|><think>"
+ },
+ {
+  "name": "anthropic budget 16384 (max)",
+  "api": "anthropic",
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hello"
+    }
+   ],
+   "thinking": {
+    "type": "enabled",
+    "budget_tokens": 16384
+   }
+  },
+  "kwargs": {
+   "reasoning_effort": "max"
+  },
+  "thinking": true,
+  "rendered": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Hello<|assistant|><think>"
+ },
+ {
+  "name": "anthropic output_config effort medium",
+  "api": "anthropic",
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hello"
+    }
+   ],
+   "output_config": {
+    "effort": "medium"
+   }
+  },
+  "kwargs": {
+   "reasoning_effort": "high"
+  },
+  "thinking": true,
+  "rendered": "[gMASK]<sop><|system|>Reasoning Effort: High<|user|>Hello<|assistant|><think>"
+ },
+ {
+  "name": "anthropic system string",
+  "api": "anthropic",
+  "request": {
+   "system": "Be brief.",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hello"
+    }
+   ]
+  },
+  "kwargs": {},
+  "thinking": true,
+  "rendered": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>Be brief.<|user|>Hello<|assistant|><think>"
+ },
+ {
+  "name": "tools offered",
+  "api": "openai",
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Current weather for a city.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "opts": {
+         "type": "object"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "kwargs": {},
+  "thinking": true,
+  "rendered": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"opts\": {\"type\": \"object\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|user|>Weather in Paris?<|assistant|><think>"
+ },
+ {
+  "name": "tools offered, thinking off",
+  "api": "openai",
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Current weather for a city.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "opts": {
+         "type": "object"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "reasoning_effort": "none"
+  },
+  "kwargs": {
+   "enable_thinking": false
+  },
+  "thinking": false,
+  "rendered": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"opts\": {\"type\": \"object\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|user|>Weather in Paris?<|assistant|><think></think>"
+ },
+ {
+  "name": "two tool calls and their results",
+  "api": "openai",
+  "request": {
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Current weather for a city.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "opts": {
+         "type": "object"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Paris and Kyoto?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning_content": "Two cities.",
+     "tool_calls": [
+      {
+       "id": "c1",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": "{\"city\": \"Paris\", \"days\": 3}"
+       }
+      },
+      {
+       "id": "c2",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": "{\"city\": \"京都\", \"opts\": {\"units\": \"C\", \"hours\": [6, 12]}}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "c1",
+     "content": "sunny, 21C"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "c2",
+     "content": "雨 (rain)"
+    }
+   ]
+  },
+  "kwargs": {},
+  "thinking": true,
+  "rendered": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"opts\": {\"type\": \"object\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|user|>Weather in Paris and Kyoto?<|assistant|><think>Two cities.</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>days</arg_key><arg_value>3</arg_value></tool_call><tool_call>get_weather<arg_key>city</arg_key><arg_value>京都</arg_value><arg_key>opts</arg_key><arg_value>{\"units\": \"C\", \"hours\": [6, 12]}</arg_value></tool_call><|observation|><tool_response>sunny, 21C</tool_response><tool_response>雨 (rain)</tool_response><|assistant|><think>"
+ },
+ {
+  "name": "anthropic tool_use and tool_result",
+  "api": "anthropic",
+  "request": {
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Current weather.",
+     "input_schema": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "opts": {
+        "type": "object"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   ],
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": [
+      {
+       "type": "thinking",
+       "thinking": "Look it up."
+      },
+      {
+       "type": "text",
+       "text": "Checking."
+      },
+      {
+       "type": "tool_use",
+       "id": "t1",
+       "name": "get_weather",
+       "input": {
+        "city": "Paris"
+       }
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "tool_result",
+       "tool_use_id": "t1",
+       "content": "sunny"
+      }
+     ]
+    }
+   ]
+  },
+  "kwargs": {},
+  "thinking": true,
+  "rendered": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Current weather.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"opts\": {\"type\": \"object\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|user|>Weather in Paris?<|assistant|><think>Look it up.</think>Checking.<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call><|observation|><tool_response>sunny</tool_response><|assistant|><think>"
+ },
+ {
+  "name": "unicode content",
+  "api": "openai",
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "你好 😀 café مرحبا"
+    }
+   ]
+  },
+  "kwargs": {},
+  "thinking": true,
+  "rendered": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>你好 😀 café مرحبا<|assistant|><think>"
+ },
+ {
+  "name": "late system message becomes user",
+  "api": "openai",
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hello"
+    },
+    {
+     "role": "assistant",
+     "content": "Hi."
+    },
+    {
+     "role": "system",
+     "content": "Hook context."
+    },
+    {
+     "role": "user",
+     "content": "Go on."
+    }
+   ]
+  },
+  "kwargs": {},
+  "thinking": true,
+  "rendered": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Hello<|assistant|><think></think>Hi.<|user|>Hook context.<|user|>Go on.<|assistant|><think>"
+ },
+ {
+  "name": "empty user",
+  "api": "openai",
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": ""
+    }
+   ]
+  },
+  "kwargs": {},
+  "thinking": true,
+  "rendered": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|><|assistant|><think>"
+ }
+]

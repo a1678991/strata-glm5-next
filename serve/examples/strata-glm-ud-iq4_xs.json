@@ -1,0 +1,42 @@
+{
+  "exe": "/opt/strata/engine/strata",
+  "args": [
+    "--pack", "/data/packs/glm-ud-iq4_xs",
+    "--native", "/models/GLM-5.3-Flash-GGUF/UD-IQ4_XS-glm5-next/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf",
+    "--expert-profile", "/data/glm/expert-profile.bin",
+    "--expert-cache", "auto",
+    "--prefill", "auto",
+    "--max-context", "262144",
+    "--kv", "int8",
+    "--kv-resident", "32768",
+    "--resident-budget-gib", "67",
+    "--conversation-cache-mib", "4096",
+    "--conversation-cache-slots", "6",
+    "--conversation-cache-disk", "/prompt-cache/glm",
+    "--conversation-cache-disk-mib", "1048576",
+    "--conversation-cache-disk-keep-superseded"
+  ],
+  "cwd": "/opt/strata",
+  "tokenizer": "/data/packs/glm-ud-iq4_xs/tokenizer",
+  "arch": "glm5-next",
+  "model_name": "glm-5.3-flash",
+  "aliases": ["glm-5.3-flash-ud-iq4_xs"],
+  "log": "/data/logs/strata-glm-ud-iq4_xs.log",
+  "lib_dirs": [],
+  "host": "0.0.0.0",
+  "port": 8080,
+  "gpu": 0,
+  "open_browser": false,
+  "sampling": {"temperature": 1.0, "top_p": 0.95, "min_p": 0.0},
+  "fit_max_tokens": true,
+  "anthropic_thinking": "on_request",
+  "expert_profile_save": "/data/glm/expert-profile-learned.bin",
+  "_status": {
+    "added_by_the_server": "serve/models.py's GLM profile appends --eos-ids 154820,154827,154829 and --turn-token 154828 (<|assistant|>) to args unless they are given here; the engine's defaults (248044,248046 and 248045) are Qwen ids",
+    "omitted_until_stage_8": "--mtp, --spec, --spec-min-p: no GLM MTP drafter yet (the flags exist, for Qwen's MTP pack)",
+    "second_card_not_yet": "plan section 7 names --layer-split auto or --expert-cache-remote; --resident-budget-gib with a layer split or remote caches exits in the engine today (generate.cpp: '--resident-cpu-experts does not support layer splits or remote expert caches', work item R1); there is no --expert-cache-remote flag, the remote caches are --expert-cache-device1..3; so this config is one card (gpu 0) until R1",
+    "to_be_produced": "/data/glm/expert-profile.bin is Stage 0's STRP profile; /data/packs/glm-ud-iq4_xs is tools/iq_pack.py's GLM pack (scripts/strata-prep.sh's GLM section)",
+    "not_verified": "no value here has run on the engine: the GLM engine path (Stages 1-7) is not complete; --resident-budget-gib 67, --conversation-cache-mib 4096, --kv-resident 32768 and 262144 context are the plan's derived values (sections 1 and 7), not measurements on Strata; sampling copies the llama profile's (docker-compose.yml: temp 1.0, top-p 0.95, min-p 0.0); the disk tier uses its own directory so Qwen's and GLM's entries never mix",
+    "effort_default": "unset effort renders 'Reasoning Effort: Max' (the template's default); the llama profile runs with reasoning_effort low. To match it, POST /settings {\"reasoning_effort\": \"low\"} (kept in strata-glm-ud-iq4_xs.shared-settings.json)"
+  }
+}
