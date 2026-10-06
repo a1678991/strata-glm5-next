@@ -19,7 +19,7 @@
 //
 // Environment (read at init):
 //   STRATA_GLM_FETCH=0           the old path (GlmExperts reads each miss through FileExpertSource::blob)
-//   STRATA_FETCH_THREADS=N       the reader's threads (default 16)
+//   STRATA_FETCH_THREADS=N       the reader's threads (default 8: see glm_fetch.cpp)
 //   STRATA_GLM_FETCH_PART=B      bytes per part (default 2 MiB)
 //   STRATA_GLM_FILE_IO=direct|pread|mmap   how a part is read (default direct)
 //   STRATA_GLM_FETCH_SLOTS=N     host slots (default 256, at least 2 x window x k + 16), page-locked, allocated on use

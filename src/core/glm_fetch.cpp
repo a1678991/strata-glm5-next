@@ -50,6 +50,10 @@ bool GlmFetch::init(const ModelGeometry& g, ExpertCache* cache, FileExpertSource
     blob_bytes_ = blob_bytes;
     active_ = false;
     if (env_int("STRATA_GLM_FETCH", 1) == 0 || src == nullptr || !src->gguf_mode()) return true;
+    // 8 threads by default: glm-mini, cold file tier, CPU pool on 16 threads (9070 XT workstation): 8 / 16 / 32
+    // reader threads read at 4.4-4.9 / 5.2-5.5 / 5.25 GB/s and decode at 27.3-29.4 (8, three runs) / 27.5-28.6
+    // (16, three runs) / 25.5 tok/s (32, one run): no difference between 8 and 16 above the noise, fewer unused
+    // lookahead reads at 8, and epyc's rf_bench peaked at 8 threads (3.68 GB/s vs 3.38 at 16).  Measure on epyc.
     FileExpertSource::ReaderOptions o;
     o.threads = env_int("STRATA_FETCH_THREADS", o.threads);
     if (const char* v = std::getenv("STRATA_GLM_FETCH_PART"); v != nullptr && *v) o.part_bytes = std::strtoull(v, nullptr, 10);

@@ -556,7 +556,7 @@ public:
     /// Mmap only.
     enum class ReadIo { Direct, Pread, Mmap };
     struct ReaderOptions {
-        int threads = 16;
+        int threads = 8;
         uint64_t part_bytes = 2ull << 20;
         ReadIo io = ReadIo::Direct;
     };
