@@ -38,7 +38,7 @@ if(STRATA_BUILD_TESTS)
                                ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
     target_link_libraries(strata_dsa_oracle PUBLIC ${_dsa_oracle_libs} ${_dsa_oracle_libs} Threads::Threads m
                           ${_strata_gpu_runtime_target})
-    foreach(t IN ITEMS dsa_indexer_parity)
+    foreach(t IN ITEMS dsa_mla_parity dsa_indexer_parity)
       add_executable(${t} tests/dsa/${t}.cpp)
       target_include_directories(${t} PRIVATE ${_strata_gpu_include_directories})
       target_link_libraries(${t} PRIVATE strata_dsa_kernels strata_dsa_oracle ${_strata_gpu_runtime_target})
@@ -46,7 +46,7 @@ if(STRATA_BUILD_TESTS)
       set_tests_properties(${t} PROPERTIES TIMEOUT 1800)
     endforeach()
   else()
-    message(STATUS "strata: STRATA_DSA_ORACLE_DIR / STRATA_DSA_ORACLE_BUILD_DIR unset - "
-                   "dsa_indexer_parity (ggml f1cee99 oracle) is NOT registered")
+    message(STATUS "strata: STRATA_DSA_ORACLE_DIR / STRATA_DSA_ORACLE_BUILD_DIR unset - dsa_mla_parity and "
+                   "dsa_indexer_parity (ggml f1cee99 oracle) are NOT registered")
   endif()
 endif()
