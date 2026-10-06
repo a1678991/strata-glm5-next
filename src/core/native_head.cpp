@@ -115,8 +115,13 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
         size_t at = 0;
         const strata::TensorInfo* t = model.find("token_embd.weight", &at);
         const strata::GgufFile& gguf = model.shard(at);
+        // glm5-next also takes a Q6_K table (GLM-5.3-Flash UD-IQ3_XXS); every other file the types it always took
+        const bool glm = arch != nullptr && arch->s == "glm5-next";
+        const auto type_ok = [&](int ty) {
+            return glm ? strata::kernels::glm_embed_type_supported(ty) : strata::kernels::embed_type_supported(ty);
+        };
         if (!t || t->shape.size() != 2 || t->shape[0] != (uint64_t) n_embd || t->shape[1] != (uint64_t) n_vocab ||
-            !strata::kernels::embed_type_supported((int) t->type) || n_embd % 256) {
+            !type_ok((int) t->type) || n_embd % 256) {
             err = "native embedding: token_embd.weight is absent, of another shape, or of a type without a GPU "
                   "dequantizer";
             return false;
