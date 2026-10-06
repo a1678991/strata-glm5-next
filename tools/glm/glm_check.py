@@ -9,6 +9,10 @@
         Full-vocabulary KL(REF || OURS) per position from two `glm-splice --logits` files (every vocabulary entry, in
         float64), its mean, median, p99 and max, and the share of positions with the same argmax ("same top p") -
         llama-perplexity --kl-divergence's two headline figures, over every position of one teacher-forced pass.
+    glm_check.py state OURS_DIR REF_DIR [--json OUT]
+        Two session-state dumps (strata STRATA_GLM_STATE: kda_hist-L, kda_state-L, dsa_latent-L, dsa_kg-L,
+        dsa_pooled-L .glmt) compared tensor by tensor: rel L2 = |ours - ref|_2 / |ref|_2 and rel max = max|ours - ref|
+        / max|ref| over the whole tensor, the share of bitwise-equal values, and for the DSA rows the worst row.
 """
 import argparse
 import json
@@ -88,6 +92,41 @@ def cmd_kld(a):
     return 0
 
 
+def cmd_state(a):
+    names = sorted(f[:-5] for f in os.listdir(a.ref) if f.endswith(".glmt"))
+
+    def key(n):
+        kind, layer = n.rsplit("-", 1)
+        return int(layer), kind
+    out = {}
+    for n in sorted(names, key=key):
+        po = os.path.join(a.ours, n + ".glmt")
+        if not os.path.exists(po):
+            print(f"{n}: missing in {a.ours}")
+            continue
+        _, A = open_glmt(po)
+        _, B = open_glmt(os.path.join(a.ref, n + ".glmt"))
+        if A.shape != B.shape:
+            print(f"{n}: shapes differ {A.shape} vs {B.shape}")
+            continue
+        x = np.asarray(A, dtype=np.float64)
+        y = np.asarray(B, dtype=np.float64)
+        d = x - y
+        rl2 = float(np.linalg.norm(d) / max(np.linalg.norm(y), 1e-30))
+        rmax = float(np.abs(d).max() / max(np.abs(y).max(), 1e-30))
+        same = float((np.asarray(A).view(np.uint32) == np.asarray(B).view(np.uint32)).mean())
+        row = np.linalg.norm(d, axis=1) / np.maximum(np.linalg.norm(y, axis=1), 1e-30)
+        r = {"rows": int(A.shape[0]), "rel_l2": rl2, "rel_max": rmax, "bitwise_equal": same,
+             "row_rel_l2_max": float(row.max()), "worst_row": int(row.argmax())}
+        out[n] = r
+        print(f"{n:16s} {A.shape[0]:7d} x {A.shape[1]:4d}: rel L2 {rl2:.3e}  rel max {rmax:.3e}  bitwise "
+              f"{100 * same:6.2f}%  worst row {r['worst_row']} ({r['row_rel_l2_max']:.3e})")
+    if a.json:
+        with open(a.json, "w") as f:
+            json.dump(out, f, indent=1)
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -100,8 +139,12 @@ def main(argv=None):
     p.add_argument("ours")
     p.add_argument("--from", dest="from_pos", type=int, default=0)
     p.add_argument("--json")
+    p = sub.add_parser("state")
+    p.add_argument("ours")
+    p.add_argument("ref")
+    p.add_argument("--json")
     a = ap.parse_args(argv)
-    return cmd_lout(a) if a.cmd == "lout" else cmd_kld(a)
+    return {"lout": cmd_lout, "kld": cmd_kld, "state": cmd_state}[a.cmd](a)
 
 
 if __name__ == "__main__":
