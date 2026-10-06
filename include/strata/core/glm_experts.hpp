@@ -5,11 +5,13 @@
 // computed on the GPU by native_expert_grouped with the clamped SwiGLU epilogue (NativeExpertLayout::swiglu_limit,
 // swiglu_clamp_exp) and Q6_K down rows where the file has them.
 //
-// WHAT DIFFERS FROM THE QWEN PATH, deliberately for this stage: an expert the VRAM cache does not hold is copied from
-// its tier (RAM or file) into a VRAM staging slot and computed there - the verify window's "PCIe share" applied to
-// every miss - instead of going to the CPU pool.  The CPU pool's clamped rows exist (native_gu_rows_clamp, wave 1)
-// and are not wired for GLM yet.  The router's ids are read back to the host once per MoE layer (a synchronization
-// per layer); nothing here is captured in a graph.
+// THE TIERS: an expert in the VRAM cache is computed there; an expert in the page-locked RAM tier is computed by the CPU
+// pool when one is attached (set_pool; GlmPool, glm_pool.hpp), its rows uploaded once and summed by the combine; an
+// expert from the file tier (and, without a pool, a RAM-tier one) is copied into a VRAM staging slot and computed on the
+// GPU.  The order of one layer call: the router's ids, weights (and, with a pool, the activation) are read back while
+// the GPU runs the shared expert; the plan; the file-tier staging; the GPU's grouped experts (VRAM + staged) launched;
+// the CPU pool on the RAM-tier experts meanwhile; the CPU rows uploaded; the combine.  One wait for the read-back and
+// one at the end of the layer; nothing here is captured in a graph.
 //
 // Order of the result, as llama.cpp f1cee99 (build_moe_ffn; G:640-657): out = sum_j w_j expert_j(x) + shexp(x)
 // (glm_moe.hpp).
@@ -27,6 +29,7 @@ namespace strata::core {
 
 class ExpertCache;
 class FileExpertSource;
+class GlmPool;
 
 class GlmExperts {
 public:
@@ -39,6 +42,11 @@ public:
         int64_t file = 0;             ///< ... read from the file tier
         uint64_t staged_bytes = 0;    ///< bytes copied into VRAM staging (RAM + file)
         double ms_fetch = 0;          ///< host time spent fetching and staging the misses
+        int64_t cpu = 0;              ///< ... of the RAM ones, computed by the CPU pool (not staged)
+        double ms_pool = 0;           ///< host time in the CPU pool (activation quantization included)
+        double ms_wait = 0;           ///< host time waiting for the GPU at the end of a layer call
+        int64_t gpu_ready = 0;        ///< layer calls with CPU work whose GPU experts had finished when the pool did
+        int64_t gpu_late = 0;         ///< ... had not (the GPU, not the pool, decided the layer's time)
     };
 
     GlmExperts() = default;
@@ -46,6 +54,8 @@ public:
     GlmExperts(const GlmExperts&) = delete;
     GlmExperts& operator=(const GlmExperts&) = delete;
 
+    /// RAM-tier experts on the CPU pool (glm_pool.hpp); call before init.  Null (the default): every miss is staged.
+    void set_pool(GlmPool* pool) { gp_ = pool; }
     /// `cache` may be null (no VRAM tier); `src` holds every expert (RAM budget and file tier).  The per-layer formats
     /// come from the loaded expert layout (kernels::cpu::expert_layout(), native).
     bool init(const ModelGeometry& g, ExpertCache* cache, FileExpertSource* src, int max_t, std::string& err);
@@ -79,6 +89,11 @@ private:
     uint64_t plan_bytes_ = 0;
     int32_t* h_ids_ = nullptr;
     float* h_w_ = nullptr;
+    GlmPool* gp_ = nullptr;
+    void* cpu_dev_ = nullptr;            ///< the CPU rows on the device: map | rows (GlmPool::device_bytes)
+    void* ev_ids_ = nullptr;             ///< cudaEvent_t: the router's read-back has landed
+    void* ev_gpu_ = nullptr;             ///< cudaEvent_t: the GPU's grouped experts are done
+    std::vector<int32_t> ent_;           ///< one expert's entries (host scratch)
     Stats st_;
 };
 
