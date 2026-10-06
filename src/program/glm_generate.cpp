@@ -17,7 +17,8 @@
 //   STRATA_GLM_LAYERS=N       run layers 0..N-1 only (no head unless N is the whole model): a stage's check
 //   STRATA_GLM_FROM=i, STRATA_GLM_INPUT=<file>   layers i..N-1 only, on the rows of <file> (llama.cpp's l_out-(i-1))
 //   STRATA_GLM_KV=f16         the DSA latent in f16 (the parity layout) instead of int8
-//   STRATA_GLM_LOGITS=<file> every position's full logits (GLMT, glm-splice --logits' format)
+//   STRATA_GLM_LOGITS=<file> every position's full logits (GLMT, glm-splice --logits' format); with
+//                             STRATA_GLM_LOGITS_FROM=P only positions >= P
 //   STRATA_GLM_PROFILE=1      per-layer GPU times
 //   STRATA_GLM_NODES=<dir>, STRATA_GLM_NODES_LAYER=l   the intermediate nodes of layer l (glm.hpp set_node_dump),
 //                             named as llama.cpp's, for glm-splice --dump of the same names
@@ -292,6 +293,8 @@ int glm_generate(const GlmRunArgs& a) {
     }
     // STRATA_GLM_LOGITS=<file>: every position's full logits (GLMT, as glm-splice --logits), for a full-vocab KLD
     std::unique_ptr<sc::GlmtWriter> logits_out;
+    int64_t logits_from = 0;   // STRATA_GLM_LOGITS_FROM=P: only the rows of positions >= P
+    if (const char* v = std::getenv("STRATA_GLM_LOGITS_FROM"); v != nullptr && *v) logits_from = std::atoll(v);
     std::vector<float> lrow;
     if (const char* p = std::getenv("STRATA_GLM_LOGITS"); p != nullptr && *p) {
         if (!full) return fail("STRATA_GLM_LOGITS needs the whole model");
@@ -336,7 +339,8 @@ int glm_generate(const GlmRunArgs& a) {
             for (int t = 0; t < n_logits; ++t) nxt[(size_t) t] = p0 + t + 1 < n ? (int32_t) a.tokens[(size_t) (p0 + t + 1)] : -1;
             if (logpos != nullptr && !eng.window_logprobs(nxt.data(), n_logits, p0, extra, logpos, err)) return fail(err);
             for (int t = 0; logits_out && t < n_logits; ++t)
-                if (!eng.copy_logits(t, lrow.data()) || !logits_out->append(lrow.data(), 1)) return fail("logits dump");
+                if (p0 + t >= logits_from && (!eng.copy_logits(t, lrow.data()) || !logits_out->append(lrow.data(), 1)))
+                    return fail("logits dump");
             if (a.stats) {
                 int32_t am[8];
                 if (!eng.argmax(n_logits, am)) return fail("argmax");
@@ -362,7 +366,8 @@ int glm_generate(const GlmRunArgs& a) {
         if (!eng.run(Tq, win.data(), q, err, x_file != nullptr ? x_in.data() : nullptr, from)) return fail(err);
         if (logpos != nullptr && !eng.window_logprobs(nxt.data(), Tq, q, extra, logpos, err)) return fail(err);
         for (int t = 0; logits_out && t < Tq; ++t)
-            if (!eng.copy_logits(t, lrow.data()) || !logits_out->append(lrow.data(), 1)) return fail("logits dump");
+            if (q + t >= logits_from && (!eng.copy_logits(t, lrow.data()) || !logits_out->append(lrow.data(), 1)))
+                return fail("logits dump");
         if (full && a.stats) {
             int32_t am[8];
             if (!eng.argmax(Tq, am)) return fail("argmax");
