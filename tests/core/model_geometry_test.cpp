@@ -208,6 +208,22 @@ void refusals(const fs::path& root) {
     ok = geometry(root / "glm-swap", g, err) && !tensors_ok(root / "glm-swap", g, err) &&
          has(err, "layer 4 is DSA+MoE by its geometry, but blk.4.ssm_a is present");
     check(ok, "layer 4 declared DSA, its tensors KDA's: " + err);
+    ok = !geometry(root / "glm-blocks", g, err) &&
+         has(err, "glm5-next.block_count = 47, expected 46 (a file with a NextN block is the whole model)");
+    check(ok, "the whole model (it has a NextN block) with 47 blocks: " + err);
+    ok = !geometry(root / "glm-slice8-kv", g, err) &&
+         has(err, "attention.head_count_kv must be a per-layer array of 8 entries");
+    check(ok, "a trunk slice whose head_count_kv has 9 entries: " + err);
+    // a trunk slice (validate's glm-mini: blocks 0-7, no NextN block): accepted, its geometry and tensors checked
+    ok = geometry(root / "glm-slice8", g, err);
+    check(ok && g.glm() && g.n_layers == 8 && g.n_layers_mtp == 0 && g.n_dense_lead == 3 && g.n_qsa_layers() == 2 &&
+              strata::core::layer_kind(g, 3) == LayerKind::DsaMoe && strata::core::layer_kind(g, 7) == LayerKind::DsaMoe &&
+              strata::core::layer_kind(g, 2) == LayerKind::KdaDense && strata::core::layer_kind(g, 4) == LayerKind::KdaMoe,
+          "a trunk slice of 8 blocks: 3 dense KDA, DSA at 3 and 7" + (err.empty() ? std::string() : ": " + err));
+    int64_t checked = 0;
+    ok = tensors_ok(root / "glm-slice8", g, err, &checked);
+    check(ok && (size_t) checked == file_tensors(root / "glm-slice8"),
+          "check_all_gguf on the slice: " + std::to_string(checked) + " tensors" + (ok ? "" : ": " + err));
     try {
         const strata::GgufModel m(shards_of(root / "llama"));
         strata::ModelArch a = strata::ModelArch::Qwen4Exp;
