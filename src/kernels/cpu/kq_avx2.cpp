@@ -238,6 +238,11 @@ void bf16_rows_dot(const uint16_t* w, int rows, int cols, const float* x, float*
 }
 
 void kq256_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, int nt,
+                   float* const* ff, int r0, int r1) {
+    kq256_gu_rows_clamp(type, blob, gu_row, up_off, n, act, nt, ff, r0, r1, 0.0f);
+}
+
+void kq256_gu_rows_clamp(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, int nt,
                    float* const* ff, int r0, int r1, float limit) {
     for (int t0 = 0; t0 < nt; t0 += MAXT) {
         const int m = nt - t0 < MAXT ? nt - t0 : MAXT;

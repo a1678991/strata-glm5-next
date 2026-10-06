@@ -9,9 +9,12 @@ namespace strata::kernels::cpu {
 
 bool iq512_supported(int ggml_type) noexcept;
 /// ff[t][r] = silu(gate_r . a[t]) * (up_r . a[t]), rows [r0, r1); gate rows at blob, up rows at blob + up_off.
-/// limit > 0: GLM-5.3-Flash's clamped SwiGLU, silu(min(g, limit)) * clamp(u, -limit, limit) (native_expert_clamp.hpp).
 void iq512_gu_rows(int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
-                   int nt, float* const* ff, int r0, int r1, float limit = 0.0f);
+                   int nt, float* const* ff, int r0, int r1);
+/// The same with GLM-5.3-Flash's clamped SwiGLU, silu(min(g, limit)) * clamp(u, -limit, limit), for limit > 0
+/// (native_expert_clamp.hpp); limit <= 0 is iq512_gu_rows exactly.
+void iq512_gu_rows_clamp(int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
+                   int nt, float* const* ff, int r0, int r1, float limit);
 /// out[t][r] = w_r . a[t], rows [r0, r1).
 void iq512_rows(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
                 float* const* out, int r0, int r1);

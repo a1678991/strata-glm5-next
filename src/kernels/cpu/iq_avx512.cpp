@@ -256,6 +256,11 @@ bool iq512_supported(int type) noexcept {
 }
 
 void iq512_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, int nt,
+                   float* const* ff, int r0, int r1) {
+    iq512_gu_rows_clamp(type, blob, gu_row, up_off, n, act, nt, ff, r0, r1, 0.0f);
+}
+
+void iq512_gu_rows_clamp(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, int nt,
                    float* const* ff, int r0, int r1, float limit) {
     switch (type) {
         case 16: gu_rows_nt<16>(nt, blob, gu_row, up_off, n, act, ff, r0, r1, limit); break;
