@@ -21,9 +21,9 @@ void check(const char* what) {
 }
 
 void validate(const DsaShapes& s, const char* what) {
-    if (s.kv_lora <= 0 || s.kv_lora % DSA_LAT_GROUP != 0 || s.idx_dim <= 0 || s.idx_dim % 2 != 0 || s.kpool < 2 ||
-        s.idx_top_k % s.kpool != 0) {
-        std::fprintf(stderr, "mla_kv: %s: unsupported geometry (kv_lora %lld must be a multiple of %d, kpool %lld)\n",
+    if (s.kv_lora <= 0 || s.kv_lora % DSA_LAT_GROUP != 0 || s.kv_lora / DSA_LAT_GROUP > 64 || s.idx_dim <= 0 ||
+        s.idx_dim % 2 != 0 || s.kpool < 2 || s.idx_top_k % s.kpool != 0) {
+        std::fprintf(stderr, "mla_kv: %s: unsupported geometry (kv_lora %lld: a multiple of %d, at most 4096; kpool %lld)\n",
                      what, (long long) s.kv_lora, DSA_LAT_GROUP, (long long) s.kpool);
         std::exit(1);
     }
@@ -258,10 +258,6 @@ void dsa_kv_append(const DsaKvCache& c, const DsaShapes& s, const int32_t* steps
                    const float* key, const float* gate, void* stream) {
     validate(s, "append");
     if (T <= 0) return;
-    if (s.kv_lora / DSA_LAT_GROUP > 64) {
-        std::fprintf(stderr, "mla_kv: append: kv_lora %lld exceeds 64 groups\n", (long long) s.kv_lora);
-        std::exit(1);
-    }
     AppendArgs a{c, latent, key, gate, steps, 0, (int) s.kv_lora, (int) s.idx_dim, (int) s.kpool};
     append_kernel<<<(unsigned) T, 256, 0, (cudaStream_t) stream>>>(a);
     check("append");
