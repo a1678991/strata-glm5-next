@@ -34,6 +34,7 @@ struct GlmRunArgs {
     int pool_workers = 0;              ///< --pool-workers (0: every physical core but the host's)
     bool no_host_worker = false;       ///< --no-host-worker
     strata::kernels::cpu::PoolAffinity pool_affinity = strata::kernels::cpu::PoolAffinity::All;   ///< --pool-affinity
+    int glm_pool = -1;                 ///< --glm-pool: 1 on, 0 off (staging), -1 auto (calibrated at start)
 };
 
 /// Runs it; the process exit code.
