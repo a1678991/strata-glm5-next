@@ -57,6 +57,7 @@
 #include "strata/core/mtp.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/core/native_dense.hpp"
+#include "strata/program/glm_generate.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
 #include "strata/program/message_boundary.hpp"
@@ -1512,10 +1513,11 @@ double pcie_frac_for_gbps(double gbps, double base) {
 }
 
 // glm5-next (GLM-5.3-Flash): the model file's header, its geometry and its tensor directory
-// are read and checked against each other and printed, and the run stops - the layer kernels (KDA, DSA/MLA, mHC, the
-// sigmoid router) are not written yet.  Headers only: nothing is allocated on a GPU and no expert is mapped or read.
+// are read and checked against each other and printed (headers only: nothing on a GPU, no expert mapped or read),
+// then the GLM decode path runs (strata::program::glm_generate).
 // -1: `any_shard` is not a glm5-next file (a qwen4exp file, or one the --native block reports as before).
-int glm5_next_preflight(const std::string& any_shard, const std::string& pack) {
+int glm5_next_preflight(const std::string& any_shard, const std::string& pack,
+                        const strata::program::GlmRunArgs* run = nullptr) {
     std::vector<std::string> shards;
     try {
         shards = strata::gguf_split_paths(any_shard);
@@ -1565,8 +1567,17 @@ int glm5_next_preflight(const std::string& any_shard, const std::string& pack) {
                          (long long) g.n_dense_lead, (long long) g.n_layers - 1, (double) lay.total / 1073741824.0,
                          (double) lay.max_blob / 1e6);
         }
-        std::fprintf(stderr, "strata generate: glm5-next: layer kernels not implemented yet\n");
-        return 1;
+        if (run == nullptr) {
+            std::fprintf(stderr, "strata generate: glm5-next: no run arguments\n");
+            return 1;
+        }
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "strata generate: --native %s: %s\n", any_shard.c_str(), e.what());
+        return 2;
+    }
+    // the decode path (src/program/glm_generate.cpp): teacher-forced verify windows, the dumps, STRATA_LOGPOS
+    try {
+        return strata::program::glm_generate(*run);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "strata generate: --native %s: %s\n", any_shard.c_str(), e.what());
         return 2;
@@ -1949,9 +1960,29 @@ int main(int argc, char** argv) {
         }
         }
     }
-    // glm5-next: header, geometry and tensor directory, then a clear stop - before any GPU call (glm5_next_preflight)
-    if (!o.native_preset.empty())
-        if (const int rc = glm5_next_preflight(o.native_preset, o.pack); rc >= 0) return rc;
+    {   // --host-core / STRATA_HOST_CORE, before the pool and the session pin any thread (glm5-next's too)
+        std::string hc = o.host_core;
+        if (hc.empty())
+            if (const char* e = std::getenv("STRATA_HOST_CORE")) hc = e;
+        if (hc == "last") strata::kernels::cpu::set_host_core(strata::kernels::cpu::HostCore::Last);
+    }
+    // glm5-next: header, geometry and tensor directory checked before any GPU call, then the GLM path (glm5_next_preflight)
+    if (!o.native_preset.empty()) {
+        strata::program::GlmRunArgs glm;
+        glm.pack = o.pack;
+        glm.native = o.native_preset;
+        glm.tokens = o.tokens;
+        glm.max_context = o.max_context;
+        glm.window = o.spec > 0 ? o.spec : 1;
+        glm.expert_cache = o.expert_cache;
+        glm.vram_reserve_mib = o.vram_reserve_mib;
+        glm.expert_profile = o.expert_profile;
+        glm.resident_budget = o.resident_budget;
+        glm.resident_pin = o.resident_pin;
+        glm.resident_headroom = o.resident_headroom;
+        glm.stats = o.stats;
+        if (const int rc = glm5_next_preflight(o.native_preset, o.pack, &glm); rc >= 0) return rc;
+    }
 #if defined(STRATA_USE_HIP)
     {   // gfx1151 (Strix Halo): the switches that are exact there are on by default (strata/core/arch_defaults.hpp); before
         // any engine code reads its switches (they are read at first use), and the user's own settings are kept
@@ -1961,12 +1992,6 @@ int main(int argc, char** argv) {
     }
 #endif
     strata::core::set_coupled_draft(o.coupled_draft);
-    {   // --host-core / STRATA_HOST_CORE, before the pool and the session pin any thread
-        std::string hc = o.host_core;
-        if (hc.empty())
-            if (const char* e = std::getenv("STRATA_HOST_CORE")) hc = e;
-        if (hc == "last") strata::kernels::cpu::set_host_core(strata::kernels::cpu::HostCore::Last);
-    }
     strata::core::set_peer_portable(o.peer_device >= 1);   // multi-GPU: the Portable flag on mapped host buffers only with a peer device (before any allocation)
     if (o.serve && o.conversation_cache_mib > 0 && (o.prompt_cache == 0 || o.conversation_cache_slots == 0))
         std::fprintf(stderr, "strata serve: warning: conversation caching is disabled by %s\n",
