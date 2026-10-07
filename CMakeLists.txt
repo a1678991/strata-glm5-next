@@ -435,6 +435,24 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_test(NAME expert_profile_save_test COMMAND expert_profile_save_test)
     set_tests_properties(expert_profile_save_test PROPERTIES TIMEOUT 60)
   endif()
+  # glm5-next: the architecture guard, ModelGeometry from the model file, the tensor-directory check and the native
+  # loaders, for both models, on header-only GGUFs of the real files (tools/gguf_header_fixture.py writes them from
+  # tests/data/gguf_headers into the build directory: Python 3, no numpy, no weights).  No GPU call.
+  if(STRATA_BUILD_TESTS)
+    add_executable(model_geometry_test tests/core/model_geometry_test.cpp)
+    target_link_libraries(model_geometry_test PRIVATE strata_engine)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+      add_test(NAME model_geometry_fixtures
+               COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/geometry_fixtures.py
+                       ${CMAKE_CURRENT_BINARY_DIR}/geometry_fixtures)
+      set_tests_properties(model_geometry_fixtures PROPERTIES FIXTURES_SETUP geometry_fixtures TIMEOUT 120)
+      add_test(NAME model_geometry_test COMMAND model_geometry_test ${CMAKE_CURRENT_BINARY_DIR}/geometry_fixtures)
+      set_tests_properties(model_geometry_test PROPERTIES FIXTURES_REQUIRED geometry_fixtures TIMEOUT 120)
+    else()
+      message(STATUS "strata: no python3 - model_geometry_test's fixtures cannot be written, the test is NOT registered")
+    endif()
+  endif()
   if(STRATA_BUILD_TESTS AND STRATA_NATIVE_EXPERTS)
     # native_experts.txt v2-v4 (the real packs' copies and the per-role shard column) and the arena filled from
     # synthetic GGUF shards at the real expert dimensions
