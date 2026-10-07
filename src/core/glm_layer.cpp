@@ -5,6 +5,7 @@
 #include "strata/core/glm_experts.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/qsa.hpp"
 
 #include <cuda_runtime.h>
@@ -542,10 +543,15 @@ bool GlmEngine::run(int T, const int32_t* tokens, int64_t pos0, std::string& err
         if (prof_) cudaEventRecord((cudaEvent_t) ev_[(size_t) l], st);
         if (!layer(l, T, err)) return false;
         if (GlmtWriter* w = dump_[(size_t) l]) {
-            const size_t n = (size_t) T * g_.hc * g_.n_embd;
-            cudaMemcpyAsync(h_dump_, x_, n * 4, cudaMemcpyDeviceToHost, st);
-            if (!cuda_ok(cudaStreamSynchronize(st), "dump", err)) return false;
-            if (!w->append(h_dump_, T)) { err = "glm: writing the l_out dump failed"; return false; }
+            // STRATA_GLM_DUMP_FROM=P: only the rows of positions >= P
+            static const int64_t dump_from = std::getenv("STRATA_GLM_DUMP_FROM") ? std::atoll(std::getenv("STRATA_GLM_DUMP_FROM")) : 0;
+            const int64_t skip = std::min<int64_t>(T, std::max<int64_t>(0, dump_from - pos0));
+            const size_t row = (size_t) g_.hc * g_.n_embd, n = (size_t) (T - skip) * row;
+            if (n > 0) {
+                cudaMemcpyAsync(h_dump_, x_ + (size_t) skip * row, n * 4, cudaMemcpyDeviceToHost, st);
+                if (!cuda_ok(cudaStreamSynchronize(st), "dump", err)) return false;
+                if (!w->append(h_dump_, T - skip)) { err = "glm: writing the l_out dump failed"; return false; }
+            }
         }
     }
     if (prof_) cudaEventRecord((cudaEvent_t) ev_[(size_t) n_run_], st);
@@ -580,6 +586,93 @@ bool GlmEngine::commit(int n_keep, std::string& err) {
     }
     last_t_ = 0;
     return cuda_ok(cudaStreamSynchronize(st), "commit", err);
+}
+
+GlmSessionView GlmEngine::session_view() const {
+    GlmSessionView v;
+    v.g = &g_;
+    v.cfg = &cfg_;
+    v.w = &w_;
+    v.embed = embed_;
+    v.kshape = kshape_;
+    v.mshape = mshape_;
+    v.dshape = dshape_;
+    v.kda_hist.assign((size_t) g_.n_layers, nullptr);
+    v.kda_state.assign((size_t) g_.n_layers, nullptr);
+    for (int64_t l = 0; l < g_.n_layers; ++l) {
+        if (g_.attn_layer(l)) continue;
+        v.kda_hist[(size_t) l] = kda_[(size_t) l].hist;
+        v.kda_state[(size_t) l] = kda_[(size_t) l].state;
+    }
+    v.dsa = dsa_;
+    v.stream = stream_;
+    v.n_run = n_run_;
+    return v;
+}
+
+bool GlmEngine::head_rows(const float* x_rows, int n, int64_t pos0, std::string& err) {
+    if (!head_runs()) { err = "glm: head_rows needs the whole model and the head"; return false; }
+    if (n < 1 || n > cfg_.max_t) { err = "glm: head_rows takes 1.." + std::to_string(cfg_.max_t) + " rows"; return false; }
+    cudaStream_t st = (cudaStream_t) stream_;
+    cudaMemcpyAsync(x_, x_rows, (size_t) n * g_.hc * g_.n_embd * 4, cudaMemcpyDeviceToDevice, st);
+    if (!head(n, err)) return false;
+    if (!cuda_ok(cudaStreamSynchronize(st), "head rows", err)) return false;
+    last_t_ = 0;   // no window to commit: the prompt path has written the state already
+    last_pos0_ = pos0;
+    return true;
+}
+
+bool GlmEngine::dump_state(const std::string& dir, int64_t n_cells, std::string& err) const {
+    cudaStream_t st = (cudaStream_t) stream_;
+    if (!cuda_ok(cudaStreamSynchronize(st), "dump state", err)) return false;
+    const int64_t DI = g_.ssm_qk_dim, DC = g_.ssm_d_conv, NH = g_.ssm_v_heads, HD = g_.ssm_state_size;
+    auto write = [&](const std::string& name, const float* host, int64_t ne0, int64_t rows) -> bool {
+        GlmtWriter w;
+        if (!w.create(dir + "/" + name + ".glmt", name, ne0, 1, err)) return false;
+        if (!w.append(host, rows) || !w.finish()) { err = "glm: writing " + name; return false; }
+        return true;
+    };
+    for (int64_t l = 0; l < n_run_; ++l) {
+        const std::string sl = std::to_string(l);
+        if (!g_.attn_layer(l)) {
+            std::vector<float> h((size_t) 3 * DI * (DC - 1)), s((size_t) NH * HD * HD);
+            if (!cuda_ok(cudaMemcpy(h.data(), kda_[(size_t) l].hist, h.size() * 4, cudaMemcpyDeviceToHost), "hist", err) ||
+                !cuda_ok(cudaMemcpy(s.data(), kda_[(size_t) l].state, s.size() * 4, cudaMemcpyDeviceToHost), "state", err))
+                return false;
+            if (!write("kda_hist-" + sl, h.data(), DC - 1, 3 * DI) || !write("kda_state-" + sl, s.data(), HD, NH * HD))
+                return false;
+            continue;
+        }
+        const sk::DsaKvCache& c = dsa_[(size_t) l];
+        const int64_t K = dshape_.kpool, L = dshape_.kv_lora, I = dshape_.idx_dim;
+        const int64_t pages = (n_cells + K - 1) / K;
+        float* d_lat = nullptr;
+        float* d_kg = nullptr;
+        if (!cuda_ok(cudaMalloc((void**) &d_lat, (size_t) pages * K * L * 4), "dump alloc", err)) return false;
+        if (!cuda_ok(cudaMalloc((void**) &d_kg, (size_t) pages * K * 2 * I * 4), "dump alloc", err)) {
+            cudaFree(d_lat);
+            return false;
+        }
+        for (int64_t p = 0; p < pages; ++p)
+            sk::dsa_kv_read_page(c, dshape_, p, d_lat + (size_t) p * K * L, d_kg + (size_t) p * K * 2 * I, st);
+        std::vector<float> lat((size_t) pages * K * L), kg((size_t) pages * K * 2 * I);
+        const int64_t n_pool = n_cells / K;
+        std::vector<uint16_t> pooled16((size_t) std::max<int64_t>(1, n_pool) * I);
+        const bool ok = cuda_ok(cudaStreamSynchronize(st), "dump read", err) &&
+                        cuda_ok(cudaMemcpy(lat.data(), d_lat, lat.size() * 4, cudaMemcpyDeviceToHost), "dump", err) &&
+                        cuda_ok(cudaMemcpy(kg.data(), d_kg, kg.size() * 4, cudaMemcpyDeviceToHost), "dump", err) &&
+                        (n_pool == 0 || cuda_ok(cudaMemcpy(pooled16.data(), c.pooled, (size_t) n_pool * I * 2,
+                                                           cudaMemcpyDeviceToHost), "dump", err));
+        cudaFree(d_lat);
+        cudaFree(d_kg);
+        if (!ok) return false;
+        std::vector<float> pooled((size_t) n_pool * I);
+        for (size_t i = 0; i < pooled.size(); ++i) pooled[i] = sk::f32_from_f16(pooled16[i]);
+        if (!write("dsa_latent-" + sl, lat.data(), L, n_cells) || !write("dsa_kg-" + sl, kg.data(), 2 * I, n_cells) ||
+            (n_pool > 0 && !write("dsa_pooled-" + sl, pooled.data(), I, n_pool)))
+            return false;
+    }
+    return true;
 }
 
 bool GlmEngine::copy_logits(int t, float* host) const {

@@ -1266,6 +1266,8 @@ endif()
 
 # GLM-5.3-Flash (glm5-next) decode kernels and their parity tests: cmake/glm_kernels.cmake
 include(cmake/glm_kernels.cmake)
+# GLM-5.3-Flash prompt path and its parity tests: cmake/glm_prefill.cmake
+include(cmake/glm_prefill.cmake)
 
 # ---- HIP gfx906: every CUDA source of the tree (and the ggml-cuda MMQ sources) is compiled as HIP ----
 if(STRATA_HIP_GFX906)
