@@ -26,6 +26,7 @@
 #include "strata/kernels/cpu/pool.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstddef>
 #include <condition_variable>
@@ -542,10 +543,80 @@ public:
     /// interesting once Phase 3 makes it not so.
     int64_t reads() const override { return reads_; }
 
+    // ---- wave 4, the GLM decode's file tier (glm_fetch.cpp): whole blobs read asynchronously into the caller's
+    // buffers by a pool of threads, each blob split into parts so that one blob keeps several reads in flight (a
+    // decode layer misses only one to three experts, and one memcpy out of the mapping is one page fault, one
+    // ~128 KiB readahead, at a time: 1.48 of the drive's 3.68 GB/s on epyc).  Urgent reads (the layer being
+    // computed) go before speculative ones (the next layer's predicted experts).  Nothing else in this class uses
+    // the pool; the Qwen paths never start it.  The GGUF in place only (`gguf_mode`).
+    //
+    /// How a part's bytes are read: O_DIRECT reads of the part's 4 KiB-aligned window into a per-thread buffer and a
+    /// copy out of it (no page cache: the request goes to the drive whole), a buffered pread, or a memcpy out of the
+    /// mapping (copy_from_files' way).  Direct falls back to Pread when a file cannot be opened O_DIRECT.  Windows:
+    /// Mmap only.
+    enum class ReadIo { Direct, Pread, Mmap };
+    struct ReaderOptions {
+        int threads = 8;
+        uint64_t part_bytes = 2ull << 20;
+        ReadIo io = ReadIo::Direct;
+    };
+    /// One blob in flight.  Owned by the caller, which must keep it in place (the threads hold its address) and not
+    /// reuse it until `read_wait` returned or `read_cancel` returned true.  The fields are the reader's.
+    struct ReadTicket {
+        int64_t layer = -1, expert = -1;
+        uint8_t* dst = nullptr;
+        int n_parts = 0, next = 0;   // parts handed out (the reader's lock)
+        int queue = 0;               // 0: in no queue, 1: urgent, 2: speculative (the reader's lock)
+        bool done = true;            // (the reader's lock)
+        std::atomic<int> left{0};
+        std::atomic<bool> failed{false};
+    };
+    struct ReaderStats {
+        int64_t blobs = 0, cancelled = 0;
+        uint64_t bytes = 0;
+        double busy_ms = 0;          ///< wall time with at least one read queued or running
+        double part_ms = 0;          ///< summed over the threads
+    };
+    /// Starts the pool (idempotent with the same options).  False when the experts are not the GGUF in place.
+    bool start_reader(const ReaderOptions& o, std::string& err);
+    void stop_reader();
+    bool reader_running() const { return !reader_.empty(); }
+    /// STRATA_FILE_COLD (measurement only): a blob read earlier must be read again, from the drive.
+    bool cold() const { return cold_; }
+    const ReaderOptions& reader_options() const { return ropt_; }
+    /// The blob of (layer, expert), blob_bytes(layer) of them, into `dst`.
+    void read_async(ReadTicket& t, int64_t layer, int64_t expert, uint8_t* dst, bool urgent);
+    /// A speculative read becomes urgent (no effect on one already urgent or fully handed out).
+    void read_promote(ReadTicket& t);
+    /// True when no part had started: the read is dropped and `t` is free.  False: it has finished or is running
+    /// (`read_wait` for it).
+    bool read_cancel(ReadTicket& t);
+    /// Blocks until every part is read; false if one failed.
+    bool read_wait(ReadTicket& t);
+    bool read_done(ReadTicket& t);
+    ReaderStats reader_stats() const;
+
+private:
+    // the wave 4 reader (see start_reader)
+    void reader_loop();
+    bool read_part(const ReadTicket& t, int part, uint8_t* bounce);
+    ReaderOptions ropt_;
+    std::vector<std::thread> reader_;
+    std::vector<int> direct_fd_;              ///< per maps_ entry: O_DIRECT descriptor (Direct), else -1
+    mutable std::mutex rmu_;
+    std::condition_variable rwork_, rdone_;
+    std::vector<ReadTicket*> rq_urgent_, rq_spec_;
+    bool rquit_ = false;
+    int64_t rinflight_ = 0;
+    std::chrono::steady_clock::time_point rbusy_t0_{};
+    ReaderStats rstats_;
+
 private:
     const uint8_t* mapped_blob(int64_t layer, int64_t expert) const;
     /// The blob's bytes from the mapped file(s) - experts.bin, or the three GGUF role slices - into `dst`.
     bool copy_from_files(int64_t layer, int64_t expert, uint8_t* dst) const;
+    /// STRATA_FILE_COLD: the blob's pages out of this process and the page cache (see the .cpp).
+    void drop_pages(int64_t layer, int64_t expert) const;
     bool open_gguf(std::string& err);
     const uint8_t* staged_blob(int64_t layer, int64_t expert);
     bool claim_stage(int64_t key, size_t& v, bool& fill);
@@ -590,6 +661,7 @@ private:
     std::vector<char> stage_busy_;            ///< being filled (outside stage_mu_): never a victim
     std::condition_variable stage_cv_;
     int fetch_threads_ = 8;
+    bool cold_ = false;                       ///< STRATA_FILE_COLD=1: measurement only, see drop_pages
     std::atomic<uint64_t> file_blob_bytes_{0}, file_us_{0};
     std::unique_ptr<std::atomic<uint32_t>[]> warm_stamp_;   ///< per (layer, expert): epoch_ + 1 when warmed
     std::atomic<int64_t> warm_hits_{0}, warm_count_{0};

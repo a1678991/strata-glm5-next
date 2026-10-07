@@ -490,8 +490,12 @@ bool GlmEngine::layer(int64_t l, int T, std::string& err) {
         return false;
     if (w.kind == LayerKind::KdaDense) {
         sk::ffn_clamp(w.ffn, xn_, f_, (int) g_.n_embd, (int) w.ffn_n_ff, T, g_.swiglu_clamp_shexp, ffn_scratch_, st);
-    } else if (!experts_->moe(w, xn_, T, f_, st, err)) {
-        return false;
+    } else {
+        // wave 4, the lookahead: the next MoE layer's router on this layer's MoE input, read back with this layer's ids
+        // (glm_fetch.hpp); it only decides which file reads start early, never what is computed
+        if (l + 1 < n_run_ && w_[(size_t) l + 1].kind != LayerKind::KdaDense && experts_->lookahead())
+            experts_->predict(w_[(size_t) l + 1], xn_, T, st);
+        if (!experts_->moe(w, xn_, T, f_, st, err)) return false;
     }
     if (dbg && !dump_node(8, f_, E, T, err)) return false;
     sk::mhc_post(f_, x_, post_, comb_, x_, mshape_, T, st);
