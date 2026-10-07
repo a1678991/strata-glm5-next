@@ -70,6 +70,22 @@ public:
     /// "glm fetch: ..." (the file tier's reader, slots, lookahead and predictor statistics).
     std::string fetch_line() const { return fetch_.stats_line(); }
 
+    /// --glm-pool auto (glm_generate.cpp): the attached CPU pool against staging + the GPU on the same RAM-tier experts.
+    /// `n` distinct experts (the layers with the most RAM-tier experts first), in calls of max_t tokens x k entries, one
+    /// expert per entry and the experts of one layer per call (as a decode window's layer call with near-uniform
+    /// routing); per call the pool also uploads its rows, staging copies the blobs on the copy stream and runs the
+    /// grouped kernel, and each call ends in a synchronization, as `moe` does.  One untimed call per arm first.  The
+    /// tiers' and the pool's statistics are left as they were.
+    struct PoolCalibration {
+        int experts = 0, calls = 0;
+        int64_t layer = -1;      ///< the first layer used
+        uint64_t bytes = 0;      ///< expert bytes per arm
+        double ms_pool = 0, ms_gpu = 0;
+    };
+    bool calibrate_pool(int n, PoolCalibration& r, std::string& err);
+    /// Detach the pool after init (calibration chose staging): every RAM-tier miss is staged again.
+    void drop_pool() { gp_ = nullptr; }
+
     const Stats& stats() const { return st_; }
     /// The tiers line: "glm experts: N entries, G experts: V vram, R ram, F file (P MB staged, X ms)".
     std::string stats_line() const;

@@ -343,6 +343,7 @@ struct Options {
     int pool_workers = 0;         ///< R2.2: 0 = "all physical cores minus the host's"; >0 overrides
     /// #272: the pool's core layout; `all` (the default) is the layout it always had, auto / p-cores are opt-in
     strata::kernels::cpu::PoolAffinity pool_affinity = strata::kernels::cpu::PoolAffinity::All;
+    int glm_pool = -1;   // glm5-next: --glm-pool on|off|auto
     /// R2.2's first half, as an A/B arm.  **ON by default**, because the measurement that justifies it is the
     /// pool's own drain: 33.7 GB/s against 5/6 x 44.14 = 36.8 for five workers, on a machine whose sixth core
     /// is reserved for a host thread that has nothing to do while the drain runs.
@@ -701,6 +702,8 @@ void usage() {
                  "                       except the one the host loop spins on (with --pool-affinity auto or\n"
                  "                       p-cores on a hybrid CPU: P-cores minus 1).  A sweep is how the pool's\n"
                  "                       deviation from `cpu_s2` is attributed.\n"
+                 "  --glm-pool MODE      glm5-next: the RAM tier's experts on the CPU pool (on), staged to the GPU\n"
+                 "                       (off), or auto (default): a calibration at start keeps the faster\n"
                  "  --pool-affinity MODE Worker CPU affinity: all (default: one worker per physical core, as\n"
                  "                       always), auto (hybrid CPUs: P-cores first, then their SMT siblings,\n"
                  "                       then E-cores) or p-cores (P-cores and their siblings only).\n"
@@ -1429,6 +1432,16 @@ int main(int argc, char** argv) {
             }
         }
         else if (a == "--no-host-worker") o.no_host_worker = true;
+        else if (a == "--glm-pool") {
+            const std::string v = next("--glm-pool");
+            if (v == "on") o.glm_pool = 1;
+            else if (v == "off") o.glm_pool = 0;
+            else if (v == "auto") o.glm_pool = -1;
+            else {
+                std::fprintf(stderr, "strata generate: unknown --glm-pool value '%s' (expected on, off or auto)\n", v.c_str());
+                return 2;
+            }
+        }
         else if (a == "--no-ple-prefetch") o.no_ple_prefetch = true;
         else if (a == "--coupled-draft") o.coupled_draft = true;
         else if (a == "--no-coupled-draft") o.coupled_draft = false;
@@ -1625,6 +1638,7 @@ int main(int argc, char** argv) {
         glm.pool_workers = o.pool_workers;
         glm.no_host_worker = o.no_host_worker;
         glm.pool_affinity = o.pool_affinity;
+        glm.glm_pool = o.glm_pool;
         if (const int rc = glm5_next_preflight(o.native_preset, o.pack, &glm); rc >= 0) return rc;
     }
     strata::core::set_coupled_draft(o.coupled_draft);
