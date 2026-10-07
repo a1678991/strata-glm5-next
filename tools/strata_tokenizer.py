@@ -12,6 +12,12 @@ offset for a byte, a merge applied in the wrong order, a pre-tokenizer split tha
 produces plausible token ids.  `decode(encode(s)) == s` is the check that sees them, and it is exact because
 the byte layer is lossless.  It is asserted over a corpus chosen to hit the boundaries: multi-byte UTF-8,
 emoji (4-byte), combining marks, whitespace runs, and C0 control bytes.
+
+TWO PRE-TOKENIZERS.  `tokenizer.ggml.pre` picks the split (PRE_TYPES): `qwen35` for the Qwen models, `glm4` for
+GLM-5.3-Flash (154,880 tokens, 321,649 merges), which also takes a pre-token piece that is in the vocabulary as one
+token without merging (llama.cpp's `ignore_merges`; 893 of GLM's tokens are not rebuilt by its merges).  The pack's
+tokenizer.json records `pre` (and `ignore_merges` when set); `Tokenizer.from_dir` reads the directory back with it.
+GLM's ids were compared with llama.cpp f1cee99's `llama-tokenize` and agreed on 117 of 117 texts (47,747 ids).
 """
 from __future__ import annotations
 
@@ -63,12 +69,41 @@ QWEN35_PATTERN = (
     r"|\s+"
 )
 
+# The `glm4` pre-tokenizer (GLM-5.3-Flash: `tokenizer.ggml.pre` = `glm4`), transcribed from llama.cpp f1cee99
+# `src/llama-vocab.cpp` L406-409, `case LLAMA_VOCAB_PRE_TYPE_CHATGLM4`; `glm4` (and `glm5`) select that case at
+# L2289-2294, which also sets `ignore_merges` (below) and drops the default BOS.  It is llama3's expression
+# character for character - `\p{L}` WITHOUT `\p{M}`, digits in runs of up to three (`\p{N}{1,3}`, where qwen35
+# has a single `\p{N}`) - and llama.cpp runs it through its hand-written llama3 splitter
+# (`src/unicode.cpp` L1054-1057 -> `unicode_regex_split_custom_llama3`, L333).
+GLM4_PATTERN = (
+    r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])"
+    r"|[^\r\n\p{L}\p{N}]?\p{L}+"
+    r"|\p{N}{1,3}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
+# `tokenizer.ggml.pre` -> (pattern, where it is transcribed from, ignore_merges).  A `pre` not listed here is
+# refused: tokenizing with another type's pattern gives plausible, wrong ids.
+#   ignore_merges (llama.cpp L633-636): a pre-token piece that is itself in the vocabulary is emitted as that one
+#   token without running the merges - with GLM's 321,649 merges these are not always the same.
+PRE_TYPES = {
+    "qwen35": (QWEN35_PATTERN, ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)", False),
+    "glm4": (GLM4_PATTERN, "llama.cpp f1cee99 src/llama-vocab.cpp L406-409 (LLAMA_VOCAB_PRE_TYPE_CHATGLM4; "
+                           "'glm4' selects it with ignore_merges at L2289-2294)", True),
+}
+
 
 class Tokenizer:
     def __init__(self, tokens: list[str], merges: list[str], token_types: list[int] | None = None,
                  pre: str = "qwen35", special_ids: dict[str, int] | None = None):
+        if pre not in PRE_TYPES:
+            raise ValueError("pre-tokenizer %r is not transcribed here (known: %s)" % (pre, ", ".join(PRE_TYPES)))
         self.tokens = tokens
         self.pre = pre
+        self.pre_pattern, self.pre_pattern_source, self.ignore_merges = PRE_TYPES[pre]
         self.token_types = token_types
         self.special_ids = special_ids or {}
         self.ids = {t: i for i, t in enumerate(tokens)}
@@ -86,7 +121,7 @@ class Tokenizer:
             if parts[0] not in self.ids or parts[1] not in self.ids:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
-        self._re = regex.compile(QWEN35_PATTERN)
+        self._re = regex.compile(self.pre_pattern)
 
         # The literals matched directly instead of being run through BPE.  GGUF token types: 3 = CONTROL,
         # 4 = USER_DEFINED.  The two classes behave DIFFERENTLY and llama.cpp's own tokenizer settled which:
@@ -135,6 +170,22 @@ class Tokenizer:
         return cls(list(md["tokenizer.ggml.tokens"]), list(md["tokenizer.ggml.merges"]),
                    list(md.get("tokenizer.ggml.token_type") or []) or None,
                    md.get("tokenizer.ggml.pre", "qwen35"), special)
+
+    @classmethod
+    def from_dir(cls, path) -> "Tokenizer":
+        """The pack's `tokenizer/` directory as `extract` writes it, with its pre-tokenizer from tokenizer.json
+        (`pre`; a directory without one is a Qwen pack's from before GLM: `qwen35`)."""
+        d = pathlib.Path(path)
+        vocab = json.loads((d / "vocab.json").read_text(encoding="utf-8"))
+        tokens = [None] * len(vocab)
+        for t, i in vocab.items():
+            tokens[i] = t
+        text = (d / "merges.txt").read_text(encoding="utf-8")
+        merges = text.split("\n") if text else []           # extract writes no trailing newline
+        types = json.loads((d / "token_type.json").read_text())
+        cfg = json.loads((d / "tokenizer.json").read_text(encoding="utf-8")) if (d / "tokenizer.json").exists() else {}
+        return cls(tokens, merges, types, cfg.get("pre", "qwen35"),
+                   {k: int(v) for k, v in (cfg.get("special_ids") or {}).items()})
 
     # -------------------------------------------------------------- the algorithm
     def _bpe(self, word: str) -> list[str]:
@@ -206,6 +257,11 @@ class Tokenizer:
         out: list[int] = []
         for piece in self._re.findall(text):
             mapped = "".join(BYTE_TO_UNICODE[b] for b in piece.encode("utf-8"))
+            if self.ignore_merges:
+                i = self.ids.get(mapped)
+                if i is not None:
+                    out.append(i)
+                    continue
             for tok in self._bpe(mapped):
                 i = self.ids.get(tok)
                 if i is None:
@@ -281,9 +337,11 @@ def extract(gguf_path, out_dir) -> dict:
         "add_bos_token": False,
         # The pattern is SHIPPED, not recomputed by the reader: it is transcribed from llama.cpp for the
         # declared `pre` type, and a C++ port that re-derived it would be free to get `\p{M}` wrong again.
-        "pre_pattern": QWEN35_PATTERN,
-        "pre_pattern_source": ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)",
+        "pre_pattern": tk.pre_pattern,
+        "pre_pattern_source": tk.pre_pattern_source,
     }
+    if tk.ignore_merges:                # only written when set: a Qwen pack's tokenizer.json stays byte-identical
+        cfg["ignore_merges"] = True
     (out / "vocab.json").write_text(json.dumps(tk.ids, ensure_ascii=False), encoding="utf-8")
     (out / "merges.txt").write_text("\n".join("%s %s" % k for k, _ in
                                               sorted(tk.ranks.items(), key=lambda kv: kv[1])), encoding="utf-8")

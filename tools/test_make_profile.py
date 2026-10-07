@@ -100,5 +100,66 @@ class Main(unittest.TestCase):
             self.assertEqual(MP.read_profile(str(out), NE), full_base())
 
 
+
+class Geometry(unittest.TestCase):
+    """GLM-5.3-Flash's shape in small: layers 0-2 without experts, 3-5 with 4, a 7th block for MTP."""
+
+    def pack(self, d):
+        lines = ["# strata native experts v3: layer gu_type d_type offset blob_bytes gate_off up_off down_off [shard] "
+                 "(n_expert 4, total 48; absolute offsets in m.gguf, or in the named shard beside it)"]
+        lines += ["%d 21 23 %d 4 0 0 0" % (l, 16 * (l - 3)) for l in (3, 4, 5)]
+        (Path(d) / "native_experts.txt").write_text("\n".join(lines) + "\n")
+        return d
+
+    def test_from_pack(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(MP.geometry_from_pack(self.pack(d)), (6, 4, [3, 4, 5]))
+
+    def test_from_gguf(self):
+        from _paths import add_gguf_py
+        add_gguf_py()
+        from gguf import GGUFWriter
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "m.gguf"
+            w = GGUFWriter(path, "glm5-next")
+            for k, v in (("block_count", 7), ("nextn_predict_layers", 1), ("expert_count", 4),
+                         ("leading_dense_block_count", 3)):
+                w.add_uint32("glm5-next." + k, v)
+            w.write_header_to_file()
+            w.write_kv_data_to_file()
+            w.close()
+            self.assertEqual(MP.geometry_from_gguf(path), (6, 4, [3, 4, 5]))
+
+    def test_layers_without_experts_are_never_ranked(self):
+        with tempfile.TemporaryDirectory() as d:
+            trace, out = Path(d) / "t.bin", Path(d) / "out.bin"
+            # layer 1 has no experts (a llama.cpp trace never names it; a wrong one is skipped), layer 4 does
+            write_trace(str(trace), [(1, [0, 1]), (4, [2]), (4, [2]), (5, [3])])
+            freq = MP.read_trace(str(trace), 4, 6, [3, 4, 5])
+            self.assertEqual(dict(freq), {(4, 2): 2, (5, 3): 1})
+            ranked, counts = MP.rank_profile([], freq, 4, no_base=True, n_layer=6, layers=[3, 4, 5])
+            self.assertEqual(ranked[:2], [(4, 2), (5, 3)])
+            self.assertEqual(len(ranked), 12)                         # 3 layers x 4, not 6 x 4
+            self.assertFalse([p for p in ranked if p[0] < 3])
+            MP.write_profile(str(out), ranked, 4, 6)
+            blob = out.read_bytes()
+            self.assertEqual(struct.unpack_from("<4s5I", blob), (b"STRP", 1, 6, 4, 12, 12))
+            self.assertEqual(MP.read_profile(str(out), 4, 6, [3, 4, 5]), ranked)
+            with self.assertRaises(SystemExit):                        # a base that ranks a dense layer
+                MP.read_profile(str(out), 4, 6, [4, 5])
+
+    def test_main_with_a_pack(self):
+        with tempfile.TemporaryDirectory() as d:
+            trace, out = Path(d) / "t.bin", Path(d) / "out.bin"
+            write_trace(str(trace), [(3, [1]), (3, [1]), (5, [0])])
+            old, sys.argv = sys.argv, ["make_profile.py", str(trace), "--pack", self.pack(d), "--no-base",
+                                       "--out", str(out)]
+            try:
+                MP.main()
+            finally:
+                sys.argv = old
+            self.assertEqual(MP.read_profile(str(out), 4, 6)[:2], [(3, 1), (5, 0)])
+            self.assertEqual(len(MP.read_profile(str(out), 4, 6)), 12)
+
 if __name__ == "__main__":
     unittest.main()
