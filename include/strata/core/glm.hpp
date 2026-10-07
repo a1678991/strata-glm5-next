@@ -37,6 +37,7 @@
 #include "strata/kernels/ffn_clamp.hpp"
 #include "strata/kernels/kda_decode.hpp"
 #include "strata/kernels/mhc.hpp"
+#include "strata/kernels/sampler.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -120,7 +121,20 @@ struct GlmConfig {
     int64_t max_cells = 4096;   ///< context capacity (the DSA caches)
     int64_t n_run = -1;         ///< run layers [0, n_run) only (-1: all); the head runs only when all do
     int kv_fmt = strata::kernels::kDsaLatInt8;   ///< the DSA latent format (int8 production, f16 parity)
+    /// --kv-resident N (serving): the DSA latent cache keeps N cells per layer in VRAM and every cell in
+    /// page-locked, device-mapped host memory (dsa.hpp "STREAMING"); 0, or N >= max_cells: fully resident.  The decode
+    /// windows make the pages they select resident (dsa_kv_stream_resolve), the prompt path reads a page that is not
+    /// resident from the host copy.  The int8 latent only.
+    int64_t kv_resident = 0;
 };
+
+/// The DSA layers' VRAM pages for `cfg` (0: fully resident, every page in VRAM).
+int64_t glm_kv_slots(const ModelGeometry& g, const GlmConfig& cfg);
+/// The smallest --kv-resident (cells) a window of `max_t` tokens can stream with: every token's selection (512 pools
+/// and its tail page) resident at once, plus one page, and never fewer than kv_stream.cu's 1,024-page resolve block.
+int64_t glm_kv_resident_min(const ModelGeometry& g, int max_t);
+/// Page-locked host bytes of the streamed DSA caches (0 when fully resident).
+uint64_t glm_session_host_bytes(const ModelGeometry& g, const GlmConfig& cfg);
 
 /// Bytes of the GLM session's device arena (state + window buffers) for `cfg`: every KDA layer's conv history and
 /// recurrent state and its window record, every DSA layer's latent cache, and the shared per-window scratch.
@@ -171,6 +185,12 @@ public:
     bool copy_logits(int t, float* host) const;
     /// The last window's greedy picks (argmax of each row).
     bool argmax(int T, int32_t* out) const;
+    /// The last window's (or head_rows') picks with the sampler chain (kernels/sampler.hpp, the Qwen verifier's head
+    /// sampling): row t draws Philox(p.seed, pos0 + t), so a seed replays the same text.  `history` (host, [T][h], may be
+    /// null with h = 0): each row's penalty window, sampler.hpp's penalty_rows.  h is at most kSampleHistoryCap.
+    static constexpr int kSampleHistoryCap = 4096;
+    bool sample(int T, const strata::kernels::SamplerParams& p, const int32_t* history, int h, int32_t* out,
+                std::string& err);
     /// STRATA_LOGPOS's rows (Verifier::window_logprobs' format and arithmetic) for the last window.
     bool window_logprobs(const int32_t* targets, int T, int64_t pos0, int32_t extra_id, std::FILE* out,
                          std::string& err) const;
@@ -198,6 +218,9 @@ public:
     int64_t vocab() const { return g_.n_vocab; }
     void* stream() const { return stream_; }
     uint64_t session_bytes() const { return arena_bytes_; }
+    /// The page-locked host copy of the streamed DSA caches (0: fully resident).
+    uint64_t session_host_bytes() const { return host_kv_bytes_; }
+    const GlmConfig& config() const { return cfg_; }
 
     /// Per-layer GPU times of the windows so far (STRATA_GLM_PROFILE=1), one line; empty when off.
     std::string profile_report() const;
@@ -227,6 +250,9 @@ private:
     void* stream_ = nullptr;
     void* arena_ = nullptr;
     uint64_t arena_bytes_ = 0;
+    void* host_kv_ = nullptr;          ///< --kv-resident: the DSA caches' host copies (page-locked, mapped)
+    uint64_t host_kv_bytes_ = 0;
+    int32_t* d_sample_ = nullptr;      ///< sample(): [max_t] picks, then [max_t][kSampleHistoryCap] histories
     strata::kernels::KdaShape kshape_;
     strata::kernels::MhcShape mshape_;
     strata::kernels::DsaShapes dshape_;

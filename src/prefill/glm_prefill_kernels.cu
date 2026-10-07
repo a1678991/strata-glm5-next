@@ -128,6 +128,9 @@ __global__ void __launch_bounds__(THREADS) prompt_attend_kernel(strata::kernels:
                 const int cell = ids ? ids[(size_t) tok * cap + c0 + t] : c0 + t;
                 const int slot = c.page_table[cell / kpool];
                 if (slot >= 0) r = (long long) slot * kpool + cell % kpool;
+                // --kv-resident: a page not in VRAM is read from the host copy (identity layout, the same
+                // bytes the slot would hold), encoded as -2 - cell; -1 stays "no cell"
+                else if (I8 ? c.host.lat_q != nullptr : c.host.lat_f16 != nullptr) r = -2 - (long long) cell;
             }
             srow[t] = r;
         }
@@ -136,9 +139,11 @@ __global__ void __launch_bounds__(THREADS) prompt_attend_kernel(strata::kernels:
         constexpr int V16 = I8 ? D / 16 : D / 8;          // 16-byte vectors per row
         for (int i = t; i < CH * V16; i += THREADS) {
             const int cc = i / V16, v = i % V16;
-            if (cc < n_here && srow[cc] >= 0) {
-                const uint4 w = I8 ? *reinterpret_cast<const uint4*>(c.lat_q + srow[cc] * D + v * 16)
-                                   : *reinterpret_cast<const uint4*>(c.lat_f16 + srow[cc] * D + v * 8);
+            if (cc < n_here && srow[cc] != -1) {
+                const bool dev = srow[cc] >= 0;
+                const long long row = dev ? srow[cc] : -2 - srow[cc];
+                const uint4 w = I8 ? *reinterpret_cast<const uint4*>((dev ? c.lat_q : c.host.lat_q) + row * D + v * 16)
+                                   : *reinterpret_cast<const uint4*>((dev ? c.lat_f16 : c.host.lat_f16) + row * D + v * 8);
                 sraw[cc][v * 4 + 0] = w.x;
                 sraw[cc][v * 4 + 1] = w.y;
                 sraw[cc][v * 4 + 2] = w.z;
@@ -148,7 +153,9 @@ __global__ void __launch_bounds__(THREADS) prompt_attend_kernel(strata::kernels:
         if constexpr (I8) {
             for (int i = t; i < CH * G; i += THREADS) {
                 const int cc = i / G, g = i % G;
-                if (cc < n_here && srow[cc] >= 0) sscale[cc][g] = f32_from_f16(c.lat_scale[srow[cc] * G + g]);
+                if (cc < n_here && srow[cc] != -1)
+                    sscale[cc][g] = f32_from_f16(srow[cc] >= 0 ? c.lat_scale[srow[cc] * G + g]
+                                                               : c.host.lat_scale[(-2 - srow[cc]) * G + g]);
             }
         }
         __syncthreads();
@@ -156,7 +163,7 @@ __global__ void __launch_bounds__(THREADS) prompt_attend_kernel(strata::kernels:
         if constexpr (I8) {
             const int h = warp, cc = lane;
             float s = -INFINITY;
-            if (cc < n_here && srow[cc] >= 0) {
+            if (cc < n_here && srow[cc] != -1) {
                 float sacc = 0.0f;
                 for (int g = 0; g < G; ++g) {
                     const float sc = sscale[cc][g];
@@ -177,7 +184,7 @@ __global__ void __launch_bounds__(THREADS) prompt_attend_kernel(strata::kernels:
             sp[h][cc] = s;
         } else {
             const int h = warp, cc = lane & 15, half = lane >> 4;
-            const bool live = cc < n_here && srow[cc] >= 0;
+            const bool live = cc < n_here && srow[cc] != -1;
             float a0 = 0.0f, a1 = 0.0f;
             if (live) {
                 const int w0 = half * (D / 4);            // D / 2 values = D / 4 words per half
@@ -221,7 +228,7 @@ __global__ void __launch_bounds__(THREADS) prompt_attend_kernel(strata::kernels:
 #pragma unroll
             for (int j = 0; j < DPT; ++j) acc[h][j] *= al[h];
         for (int cc = 0; cc < n_here; ++cc) {
-            if (srow[cc] < 0) continue;
+            if (srow[cc] == -1) continue;
             const float4 p0 = *reinterpret_cast<const float4*>(&spt[cc][0]);
             const float4 p1 = *reinterpret_cast<const float4*>(&spt[cc][4]);
             const float p[HG] = {p0.x, p0.y, p0.z, p0.w, p1.x, p1.y, p1.z, p1.w};
@@ -313,7 +320,8 @@ void dsa_prompt_attend(const strata::kernels::DsaKvCache& c, const strata::kerne
     if (s.n_head % HG != 0) refuse("dsa_prompt_attend: n_head must be a multiple of 8");
     if (s.kv_lora != 512 && s.kv_lora != 256) refuse("dsa_prompt_attend: kv_lora must be 256 or 512");
     if (T > 65535) refuse("dsa_prompt_attend: more than 65535 tokens");
-    if (c.n_slots < c.n_pages) refuse("dsa_prompt_attend: the latent cache must be fully resident");
+    if (c.n_slots < c.n_pages && !c.host.present())
+        refuse("dsa_prompt_attend: a streamed latent cache needs its host copy");
     const dim3 grid((unsigned) (s.n_head / HG), (unsigned) T);
     cudaStream_t st = (cudaStream_t) stream;
     const int H = (int) s.n_head, K = (int) s.kpool;
