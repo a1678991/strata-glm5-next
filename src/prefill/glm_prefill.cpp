@@ -291,6 +291,7 @@ struct GlmPrefill::Impl {
     Dims d;
     Bufs b;
     void* arena = nullptr;
+    float* tail = nullptr;   // the head's rows when they span chunks: [max_t][hc][n_embd]
     cudaStream_t st = nullptr, copy = nullptr;
     glm::Gemm16 gemm;
     sk::SigmoidRouterShape rs;
@@ -324,6 +325,7 @@ struct GlmPrefill::Impl {
                         (void*) h_w_sorted, (void*) h_ring})
             if (p) cudaFreeHost(p);
         if (arena) cudaFree(arena);
+        if (tail) cudaFree(tail);
     }
 
     // Y[T][N] (row stride ldy) = X16[T][K] (row stride ldx) . W^T, W the GGUF blocks of `type`: dequantized to FP16
@@ -705,6 +707,17 @@ bool GlmPrefill::run(const int32_t* tokens, int64_t n, int64_t pos0, int n_logit
     }
     const auto t0 = Clock::now();
     const int64_t C = m.d.T, E = m.d.E, HC = m.d.HC;
+    // the head's rows: positions [keep, pos0 + n), the last nl of the prompt.  When the last chunk holds fewer than nl
+    // tokens they span chunks: each chunk's rows at positions >= keep are kept in `tail` (after its last layer, before
+    // the next chunk overwrites x), and the head reads them from there
+    const int64_t nl = m.eng->head_runs() && n_logits > 0
+                           ? std::min<int64_t>({(int64_t) n_logits, (int64_t) m.v.cfg->max_t, n}) : 0;
+    const int64_t keep = pos0 + n - nl;
+    const bool span = nl > 0 && (n - 1) / C * C > n - nl;   // the last chunk starts after the first kept row
+    const size_t xrow = (size_t) HC * E;
+    if (span && m.tail == nullptr &&
+        !cuda_ok(cudaMalloc((void**) &m.tail, (size_t) m.v.cfg->max_t * xrow * 4), "the head's rows", err))
+        return false;
     for (int64_t q = 0; q < n; q += C) {
         const int64_t T = std::min(C, n - q), p0 = pos0 + q;
         m.tm.mark(kEmbed, m.st);
@@ -728,10 +741,15 @@ bool GlmPrefill::run(const int32_t* tokens, int64_t n, int64_t pos0, int n_logit
         for (int64_t l = 0; l < m.v.n_run; ++l)
             if (!m.layer(l, T, p0, err)) return false;
         const bool last = q + T == n;
-        if (last && m.eng->head_runs() && n_logits > 0) {
-            const int nl = (int) std::min<int64_t>({(int64_t) n_logits, (int64_t) m.v.cfg->max_t, T});
+        if (span && p0 + T > keep) {   // this chunk's rows among the head's
+            const int64_t a = std::max(p0, keep);
+            cudaMemcpyAsync(m.tail + (size_t) (a - keep) * xrow, m.b.x + (size_t) (a - p0) * xrow,
+                            (size_t) (p0 + T - a) * xrow * 4, cudaMemcpyDeviceToDevice, m.st);
+        }
+        if (last && nl > 0) {
             m.tm.mark(kHead, m.st);
-            if (!m.eng->head_rows(m.b.x + (size_t) (T - nl) * HC * E, nl, p0 + T - nl, err)) return false;
+            const float* rows = span ? m.tail : m.b.x + (size_t) (T - nl) * xrow;
+            if (!m.eng->head_rows(rows, (int) nl, keep, err)) return false;
         }
         m.tm.mark(kEmbed, m.st);
         if (!cuda_ok(cudaStreamSynchronize(m.st), "chunk", err) || !cuda_ok(cudaGetLastError(), "chunk kernels", err))
