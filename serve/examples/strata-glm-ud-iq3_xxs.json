@@ -1,0 +1,36 @@
+{
+  "exe": "/path/to/Strata/engine/strata",
+  "args": [
+    "--pack", "/path/to/Strata/data/packs/glm-ud-iq3_xxs",
+    "--native", "/path/to/Strata/data/models/GLM-5.3-Flash-UD-IQ3_XXS/GLM-5.3-Flash-UD-IQ3_XXS-00001-of-00004.gguf",
+    "--expert-profile", "/path/to/Strata/data/glm/expert-profile.strp",
+    "--expert-cache", "auto",
+    "--prefill", "auto",
+    "--glm-pool", "auto",
+    "--kv", "int8",
+    "--kv-resident", "32768",
+    "--max-context", "262144",
+    "--resident-budget-gib", "67",
+    "--conversation-cache-mib", "4096",
+    "--conversation-cache-slots", "4",
+    "--conversation-cache-disk", "/path/to/Strata/data/prompt-cache/glm",
+    "--conversation-cache-disk-mib", "1048576"
+  ],
+  "cwd": "/path/to/Strata",
+  "tokenizer": "/path/to/Strata/data/packs/glm-ud-iq3_xxs/tokenizer",
+  "arch": "glm5-next",
+  "model_name": "glm-5.3-flash",
+  "aliases": ["glm-5.3-flash-ud-iq3_xxs"],
+  "log": "/path/to/Strata/strata-glm-ud-iq3_xxs.log",
+  "lib_dirs": [],
+  "port": 8080,
+  "sampling": {"temperature": 1.0, "top_p": 0.95, "min_p": 0.0, "top_k": 40},
+  "fit_max_tokens": true,
+  "anthropic_thinking": "on_request",
+  "_comment": [
+    "A hand-written run config for GLM-5.3-Flash UD-IQ3_XXS (setup.py does not install GLM); docs/GLM.md explains every value.",
+    "Replace /path/to/Strata. The values were measured on one RTX 3090 with 94 GiB of RAM: --resident-budget-gib follows setup's rule RAM - 24 - ceil(KV RAM) (67 there), --conversation-cache-mib is 4 GiB because a parked GLM conversation is 152.6 MB of KDA state plus 12,320 B per token.",
+    "--glm-pool auto times the CPU pool against staging to the GPU at start; on a 23-core Zen 4 server staging won in real decode (7.05 vs 5.90 tok/s) although auto picked the pool, so measure both (--glm-pool on / off) on a new machine.",
+    "serve/models.py's GLM profile adds --eos-ids 154820,154827,154829 and --turn-token 154828 to args."
+  ]
+}
