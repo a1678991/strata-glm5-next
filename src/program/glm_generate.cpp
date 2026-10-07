@@ -49,13 +49,16 @@
 #include "strata/artifact/gguf_split.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_source.hpp"
+#include "strata/core/conversation_memory.hpp"
 #include "strata/core/glm.hpp"
+#include "strata/core/glm_conversation.hpp"
 #include "strata/core/glm_experts.hpp"
 #include "strata/core/glm_pool.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/prefill/glm_prefill.hpp"
+#include "strata/program/glm_serve.hpp"
 
 #include <cuda_runtime.h>
 
@@ -64,11 +67,15 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <memory>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string>
 #include <vector>
+
+#include <unistd.h>
 
 namespace strata::program {
 namespace {
@@ -124,6 +131,52 @@ int64_t auto_chunk(const sc::ModelGeometry& g, const sc::GlmConfig& cfg, int64_t
     return pick;
 }
 
+// What a configuration needs in VRAM besides the expert cache, said when it does not fit (--max-context and
+// --kv-resident decide the DSA latent cache, which the session holds; the prompt path's buffers come on top).
+std::string vram_shortfall(const sc::ModelGeometry& g, const sc::GlmConfig& cfg, double session_mib, double staging_mib,
+                           double prompt_mib, int reserve_mib, double free) {
+    const int64_t slots = sc::glm_kv_slots(g, cfg);
+    const int64_t cells = slots > 0 ? cfg.kv_resident : cfg.max_cells;
+    const double dsa_mib = (double) g.n_qsa_layers() * (double) cells *
+                           (double) (g.kv_lora + g.kv_lora / 64 * 4 + 4 * g.idx_key_dim + 2 * g.idx_key_dim / std::max<int64_t>(1, g.idx_kpool)) /
+                           1048576.0;
+    char b[768];
+    std::snprintf(b, sizeof b, "not enough VRAM: %.0f MiB free; the session needs %.0f MiB (context %lld, the DSA latent "
+                               "cache %.0f MiB of it with %s), the expert staging %.0f MiB, the prompt path's buffers "
+                               "%.0f MiB, the reserve %d MiB + 512 MiB.  Lower --max-context, keep fewer DSA cells in "
+                               "VRAM (--kv-resident N streams the rest from page-locked RAM), or a smaller --prefill "
+                               "chunk", free, session_mib, (long long) cfg.max_cells, dsa_mib,
+                 slots > 0 ? ("--kv-resident " + std::to_string((long long) cfg.kv_resident)).c_str()
+                           : "every cell resident", staging_mib, prompt_mib, reserve_mib);
+    return b;
+}
+
+// STRATA_GLM_SPLIT_RESTORE: the session after ids[0, n) parked (in RAM: the image itself), the session dirtied (reset, then 8 junk windows that
+// write KDA state and DSA cells 0..7), and the image restored.
+bool split_park_restore(sc::GlmEngine& eng, const std::vector<int32_t>& ids, int64_t n, const std::string& how,
+                        std::string& err) {
+    const sc::GlmSessionView view = eng.session_view();
+    std::vector<int32_t> live(ids.begin(), ids.begin() + n);
+    const std::vector<sc::ConversationImageKey> no;
+    const std::vector<sc::ConversationCheckpoint> chain;
+    sc::SavedConversation image;
+    if (!sc::glm_snapshot_save(image, sc::ConversationView{live, no, chain, true}, view, err)) return false;
+    if (how != "ram") {
+        err = "STRATA_GLM_SPLIT_RESTORE is ram";
+        return false;
+    }
+    if (!eng.reset(err)) return false;
+    for (int i = 0; i < 8; ++i) {
+        const int32_t junk = 1000 + 37 * i;
+        if (!eng.run(1, &junk, i, err) || !eng.commit(1, err)) return false;
+    }
+    if (sc::glm_snapshot_restore(image, view, err) != sc::ConversationRestore::restored) return false;
+    std::fprintf(stderr, "strata generate: glm5-next: STRATA_GLM_SPLIT_RESTORE=%s: the session after %lld tokens parked "
+                         "(%.1f MiB), dirtied and restored\n", how.c_str(), (long long) n,
+                 (double) image.bytes() / 1048576.0);
+    return true;
+}
+
 }  // namespace
 
 int glm_generate(const GlmRunArgs& a) {
@@ -138,7 +191,7 @@ int glm_generate(const GlmRunArgs& a) {
     } catch (const std::exception& e) {
         return fail(e.what());
     }
-    if (a.tokens.size() < 1) return fail("no tokens (--tokens / --tokens-file)");
+    if (a.tokens.size() < 1 && !a.serve) return fail("no tokens (--tokens / --tokens-file)");
     for (const int64_t t : a.tokens)
         if (t < 0 || t >= g.n_vocab) return fail("token id " + std::to_string(t) + " is outside the vocabulary");
     int64_t n_run = g.n_layers;
@@ -146,7 +199,9 @@ int glm_generate(const GlmRunArgs& a) {
     if (n_run < 1 || n_run > g.n_layers) return fail("STRATA_GLM_LAYERS must be 1.." + std::to_string(g.n_layers));
     const bool full = n_run == g.n_layers;
     const int T = std::max(1, std::min(8, a.window));
-    const int64_t max_cells = std::max<int64_t>(a.max_context, (int64_t) a.tokens.size() + std::max<int64_t>(0, a.max_new));
+    const int64_t max_cells = a.serve ? a.max_context
+                                      : std::max<int64_t>(a.max_context, (int64_t) a.tokens.size() + std::max<int64_t>(0, a.max_new));
+    if (a.serve && (max_cells < 16 || max_cells > INT32_MAX / 4)) return fail("--max-context out of range");
     // the prompt path: positions [0, P) in chunks (--prefill N, or auto: the largest of kAutoChunks that fits, chosen
     // below where the VRAM is budgeted: with --expert-cache auto before the cache is sized, else from the VRAM left
     // once the session is in)
@@ -154,11 +209,29 @@ int glm_generate(const GlmRunArgs& a) {
     int64_t pf_chunk = a.prefill_auto ? kAutoChunks[0] : a.prefill_chunk;
     bool pf_chosen = !a.prefill_auto;
     int64_t P = 0;
-    if (pf_chunk > 0) {
+    if (pf_chunk > 0 && a.serve) {
+        P = max_cells;   // --serve: any prompt up to the context; the chunk is chosen for the longest
+    } else if (pf_chunk > 0) {
         P = a.prefill_until > 0 ? std::min<int64_t>(a.prefill_until, n_tok) : std::max<int64_t>(1, n_tok - 1);
         if (std::getenv("STRATA_GLM_FROM") != nullptr) return fail("STRATA_GLM_FROM does not combine with --prefill");
     }
     const bool any_moe = n_run > g.n_dense_lead;
+    // the session's configuration (the expert cache's sizing below counts exactly this session)
+    sc::GlmConfig cfg;
+    cfg.max_t = T;
+    cfg.max_cells = max_cells;
+    cfg.n_run = n_run;
+    if (const char* v = std::getenv("STRATA_GLM_KV"); v != nullptr && std::string(v) == "f16")
+        cfg.kv_fmt = strata::kernels::kDsaLatF16;
+    if (a.kv == "f16") cfg.kv_fmt = strata::kernels::kDsaLatF16;
+    else if (a.kv != "int8" && !a.kv.empty()) return fail("--kv " + a.kv + ": glm5-next keeps its DSA latent as int8 (or f16)");
+    cfg.kv_resident = a.kv_resident;
+    if (sc::glm_kv_slots(g, cfg) > 0 && cfg.kv_fmt != strata::kernels::kDsaLatInt8)
+        return fail("--kv-resident streams the int8 latent only (not --kv f16)");
+    if (sc::glm_kv_slots(g, cfg) > 0 && cfg.kv_resident < sc::glm_kv_resident_min(g, T))
+        return fail("--kv-resident " + std::to_string((long long) cfg.kv_resident) + " is below the " +
+                    std::to_string((long long) sc::glm_kv_resident_min(g, T)) + " cells a streamed cache needs (a window of " +
+                    std::to_string(T) + " token(s): its selections resident at once, and at least 1,024 pages)");
     if (!strata::kernels::cpu::expert_layout_load(a.pack, g.n_layers, g.n_expert, err, g.n_embd, g.n_ff,
                                                   g.n_dense_lead))
         return fail(a.pack + ": " + err);
@@ -214,16 +287,15 @@ int glm_generate(const GlmRunArgs& a) {
         // once the session and the staging buffers are counted (estimated here, before they exist)
         int64_t want = a.expert_cache;
         if (want < 0) {
-            sc::GlmConfig probe;
-            probe.max_t = T;
-            probe.max_cells = max_cells;
+            sc::GlmConfig probe = cfg;
             const double session = (double) sc::glm_session_bytes(g, probe) / 1048576.0;
             // the staging slots, and the lookahead's VRAM slots when STRATA_GLM_PRESTAGE asks for them
             const char* pre = std::getenv("STRATA_GLM_PRESTAGE");
             const int64_t n_pre = pre != nullptr ? std::max<int64_t>(0, std::min<int64_t>(64, std::atoll(pre))) : 0;
             const double staging = (double) (T * g.n_expert_used + n_pre) * (double) lay.max_blob / 1048576.0;
-            probe.n_run = n_run;
             double room = free_mib() - session - staging - 512.0 - (double) a.vram_reserve_mib;
+            if (room < 0)   // say what does not fit instead of failing later in an allocation
+                return fail(vram_shortfall(g, cfg, session, staging, 0.0, a.vram_reserve_mib, free_mib()));
             if (P > 0 && !pf_chosen) {   // --prefill auto: the chunk first, then the cache gets the rest
                 // (the share, or whatever the cache cannot use once every expert is in it)
                 double all = 0;
@@ -237,6 +309,8 @@ int glm_generate(const GlmRunArgs& a) {
             const double prompt = P > 0 ? (double) strata::prefill::GlmPrefill::bytes_needed(
                                               g, probe, std::min<int64_t>(pf_chunk, P)) / 1048576.0 : 0.0;
             room -= prompt;
+            if (room < 0)
+                return fail(vram_shortfall(g, cfg, session, staging, prompt, a.vram_reserve_mib, free_mib()));
             want = 0;
             for (const auto& [l, e] : ranked) {
                 const double b = (double) lay.blob_bytes(l) / 1048576.0;
@@ -313,19 +387,31 @@ int glm_generate(const GlmRunArgs& a) {
     }
 
     // ---- the session
-    sc::GlmConfig cfg;
-    cfg.max_t = T;
-    cfg.max_cells = max_cells;
-    cfg.n_run = n_run;
-    if (const char* v = std::getenv("STRATA_GLM_KV"); v != nullptr && std::string(v) == "f16")
-        cfg.kv_fmt = strata::kernels::kDsaLatF16;
+    if (const uint64_t host = sc::glm_session_host_bytes(g, cfg); host > 0) {
+        // the streamed DSA caches' host copy is page-locked: refuse clearly rather than pin past what the RAM has
+        // (2 GiB kept back for everything else this process allocates later)
+        const std::optional<uint64_t> avail = sc::conversation_available_memory();
+        if (avail && host + (2ull << 30) > *avail)
+            return fail("not enough RAM for the DSA caches' host copy: --max-context " + std::to_string((long long) max_cells) +
+                        " with --kv-resident " + std::to_string((long long) cfg.kv_resident) + " pins " +
+                        std::to_string((long long) (host >> 20)) + " MiB, " + std::to_string((long long) (*avail >> 20)) +
+                        " MiB are available (2 GiB kept back): lower --max-context");
+    }
     sc::GlmEngine eng;
-    if (!eng.init(wt, g, embed, full ? &head : nullptr, any_moe ? &experts : nullptr, cfg, err)) return fail(err);
-    std::fprintf(stderr, "strata generate: glm5-next: session %.1f MiB (window %d, context %lld, DSA latent %s), "
+    if (!eng.init(wt, g, embed, full ? &head : nullptr, any_moe ? &experts : nullptr, cfg, err)) {
+        cudaGetLastError();
+        return fail(err + " (" + vram_shortfall(g, cfg, (double) sc::glm_session_bytes(g, cfg) / 1048576.0, 0.0, 0.0,
+                                                0, free_mib()) + ")");
+    }
+    std::fprintf(stderr, "strata generate: glm5-next: session %.1f MiB (window %d, context %lld, DSA latent %s%s), "
                          "layers 0-%lld%s; %.0f MiB of VRAM free\n",
                  (double) eng.session_bytes() / 1048576.0, T, (long long) max_cells,
-                 cfg.kv_fmt == strata::kernels::kDsaLatF16 ? "f16" : "int8", (long long) n_run - 1,
-                 full ? " and the head" : " (no head: STRATA_GLM_LAYERS)", free_mib());
+                 cfg.kv_fmt == strata::kernels::kDsaLatF16 ? "f16" : "int8",
+                 sc::glm_kv_slots(g, cfg) > 0
+                     ? (", " + std::to_string((long long) cfg.kv_resident) + " cells per layer in VRAM, " +
+                        std::to_string((long long) (eng.session_host_bytes() >> 20)) + " MiB page-locked").c_str()
+                     : "",
+                 (long long) n_run - 1, full ? " and the head" : " (no head: STRATA_GLM_LAYERS)", free_mib());
 
     strata::prefill::GlmPrefill prefill;
     if (P > 0 && !pf_chosen) {   // --prefill auto without --expert-cache auto: what the session and the cache left
@@ -336,12 +422,47 @@ int glm_generate(const GlmRunArgs& a) {
     }
     if (P > 0) {
         if (!prefill.init(eng, cache.valid() ? &cache : nullptr, any_moe ? &src : nullptr, std::min<int64_t>(pf_chunk, P),
-                          err))
-            return fail(err);
+                          err)) {
+            cudaGetLastError();
+            return fail(err + " (" + vram_shortfall(g, cfg, 0.0, 0.0, (double) strata::prefill::GlmPrefill::bytes_needed(
+                                                    g, cfg, std::min<int64_t>(pf_chunk, P)) / 1048576.0, 0, free_mib()) +
+                        ")");
+        }
         std::fprintf(stderr, "strata generate: glm5-next: prompt path: positions 0-%lld in chunks of %lld tokens "
                              "(%.1f MiB of buffers), the rest through windows; %.0f MiB of VRAM free\n",
                      (long long) P - 1, (long long) prefill.chunk(), (double) prefill.device_bytes() / 1048576.0,
                      free_mib());
+    }
+
+    // ---- --serve: the persistent engine takes it from here (src/program/glm_serve.cpp)
+    if (a.serve) {
+        if (!full) return fail("--serve needs the whole model (unset STRATA_GLM_LAYERS)");
+        if (P == 0)
+            std::fprintf(stderr, "strata serve: glm5-next: no --prefill: every prompt token goes through the windows\n");
+        struct ServePin {
+            strata::kernels::cpu::ThreadAffinity prev;
+            ~ServePin() { if (prev.valid) strata::kernels::cpu::restore_thread_affinity(prev); }
+        } serve_pin;
+        if (glm_pool && glm_pool->ready()) {   // the pool's reserved core (--host-core), as the Qwen session pins it
+            const int host_core = strata::kernels::cpu::planned_host_core(a.pool_affinity);
+            const std::vector<int> cores = strata::kernels::cpu::physical_cores(false);
+            if (host_core >= 0) serve_pin.prev = strata::kernels::cpu::pin_current_thread(host_core);
+            else if (!cores.empty()) serve_pin.prev = strata::kernels::cpu::pin_current_thread(cores[0]);
+        }
+        GlmServeParts parts;
+        parts.args = &a;
+        parts.g = &g;
+        parts.shards = shards;
+        parts.eng = &eng;
+        parts.prefill = P > 0 ? &prefill : nullptr;
+        parts.experts = any_moe ? &experts : nullptr;
+        parts.src = any_moe ? &src : nullptr;
+        parts.cache = cache.valid() ? &cache : nullptr;
+        parts.window = T;
+        parts.pool_workers = glm_pool && glm_pool->ready() ? glm_pool->workers() : 0;
+        const double load_s = std::chrono::duration<double>(Clock::now() - t_start).count();
+        std::fprintf(stderr, "strata generate: glm5-next: loaded in %.1f s; serving\n", load_s);
+        return glm_serve(parts);
     }
 
     // ---- the dumps
@@ -452,7 +573,21 @@ int glm_generate(const GlmRunArgs& a) {
         if (const char* v = std::getenv("STRATA_GLM_PREFILL_LOGPOS"); v != nullptr && *v)
             n_logits = std::max(1, std::min(T, std::atoi(v)));
         n_logits = (int) std::min<int64_t>(n_logits, P);
-        if (!prefill.run(ids.data(), P, 0, full ? n_logits : 0, err)) return fail(err);
+        // STRATA_GLM_PREFILL_SPLIT=a: the prompt path reads [0, a) and then [a, P) as a second call at pos0 = a
+        // (a serve request continuing a conversation); STRATA_GLM_SPLIT_RESTORE=ram parks the session after the
+        // first part (glm_conversation.hpp), dirties it (a reset and junk windows), and restores it before the second:
+        // the rows after P must be byte-identical to the split without the restore
+        int64_t split = 0;
+        if (const char* v = std::getenv("STRATA_GLM_PREFILL_SPLIT"); v != nullptr && *v) split = std::atoll(v);
+        if (split > 0 && split < P) {
+            if (!prefill.run(ids.data(), split, 0, 0, err)) return fail(err);
+            if (const char* r = std::getenv("STRATA_GLM_SPLIT_RESTORE"); r != nullptr && *r) {
+                if (!split_park_restore(eng, ids, split, r, err)) return fail(err);
+            }
+            if (!prefill.run(ids.data() + split, P - split, split, full ? n_logits : 0, err)) return fail(err);
+        } else if (!prefill.run(ids.data(), P, 0, full ? n_logits : 0, err)) {
+            return fail(err);
+        }
         last_rows = n_logits;
         prefill_s = std::chrono::duration<double>(Clock::now() - tp).count();
         if (full) {   // the prompt's last positions: the rows the windows would have written for them

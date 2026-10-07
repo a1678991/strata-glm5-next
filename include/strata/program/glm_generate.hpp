@@ -35,6 +35,22 @@ struct GlmRunArgs {
     bool no_host_worker = false;       ///< --no-host-worker
     strata::kernels::cpu::PoolAffinity pool_affinity = strata::kernels::cpu::PoolAffinity::All;   ///< --pool-affinity
     int glm_pool = -1;                 ///< --glm-pool: 1 on, 0 off (staging), -1 auto (calibrated at start)
+    // ---- --serve (src/program/glm_serve.cpp): the stdin/stdout protocol of generate.cpp's serve loop
+    bool serve = false;                ///< --serve: stay resident and take GEN requests on stdin
+    bool window_given = false;         ///< --spec T was given (serve: the teacher-forced read window; default 1)
+    std::string kv = "int8";           ///< --kv int8 (production) | f16 (the parity latent, never streamed)
+    int64_t kv_resident = 0;           ///< --kv-resident N: DSA cells per layer kept in VRAM (0: all)
+    std::vector<int64_t> eos_ids;      ///< --eos-ids: a generated id among them ends the reply ("stop")
+    int64_t turn_token = -1;           ///< --turn-token: the checkpoint goes in front of the last one in a prompt
+    int64_t tail_role_token = -1;      ///< --tail-role-token: not used by GLM (said once)
+    int prompt_cache = 6;              ///< --prompt-cache N: conversation checkpoints kept (0: none)
+    int64_t prompt_cache_every = 16384;   ///< --prompt-cache-every N: also every N freshly read prompt tokens
+    int64_t prompt_cache_root = 2048;  ///< --prompt-cache-root N: the first turn boundary of a prompt read from 0
+    int64_t short_read = 64;           ///< --short-read N: a prompt part of at most N tokens goes through the windows
+    int64_t conversation_cache_mib = 0;          ///< --conversation-cache-mib: RAM for parked conversations
+    int conversation_cache_slots = 4;            ///< --conversation-cache-slots
+    int64_t conversation_cache_min_free_mib = 2560;   ///< --conversation-cache-min-free-mib
+    std::string expert_profile_save;   ///< --expert-profile-save: not used by GLM (no adaptive tier; said once)
 };
 
 /// Runs it; the process exit code.
