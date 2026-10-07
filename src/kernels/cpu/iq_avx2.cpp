@@ -11,6 +11,7 @@
 //
 // Formats: IQ2_XXS (16), IQ2_XS (17), IQ3_XXS (18), IQ3_S (21), IQ2_S (22), IQ4_XS (23).  IQ1_M stays on ggml-cpu.
 #include "strata/kernels/cpu/iq_avx2.hpp"
+#include "strata/kernels/cpu/native_expert_clamp.hpp"
 
 #define GGML_COMMON_DECL_CPP
 #define GGML_COMMON_IMPL_CPP
@@ -352,11 +353,19 @@ inline void row_dot_any(const uint8_t* row, int nblocks, const block_q8_K* const
 
 template <int TY, int NT>
 void gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, float* const* ff,
-             int r0, int r1) {
+             int r0, int r1, float limit) {
     const block_q8_K* y[NT];
     for (int t = 0; t < NT; ++t) y[t] = (const block_q8_K*) act[t];
     const int nb = n / QK_K;
     float g[NT], u[NT];
+    if (limit > 0.0f) {   // GLM-5.3-Flash's clamped SwiGLU (native_expert_clamp.hpp); the loop below is unchanged
+        for (int r = r0; r < r1; ++r) {
+            row_dot_any<TY, NT>(blob + (size_t) r * gu_row, nb, y, g);
+            row_dot_any<TY, NT>(blob + up_off + (size_t) r * gu_row, nb, y, u);
+            for (int t = 0; t < NT; ++t) ff[t][r] = swiglu_clamped(g[t], u[t], limit);
+        }
+        return;
+    }
     for (int r = r0; r < r1; ++r) {
         row_dot_any<TY, NT>(blob + (size_t) r * gu_row, nb, y, g);
         row_dot_any<TY, NT>(blob + up_off + (size_t) r * gu_row, nb, y, u);
@@ -377,16 +386,16 @@ void dot_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* act,
 
 template <int TY>
 void gu_rows_nt(int nt, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
-                float* const* ff, int r0, int r1) {
+                float* const* ff, int r0, int r1, float limit) {
     switch (nt) {
-        case 1: gu_rows<TY, 1>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 2: gu_rows<TY, 2>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 3: gu_rows<TY, 3>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 4: gu_rows<TY, 4>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 5: gu_rows<TY, 5>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 6: gu_rows<TY, 6>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 7: gu_rows<TY, 7>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        default: gu_rows<TY, 8>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 1: gu_rows<TY, 1>(blob, gu_row, up_off, n, act, ff, r0, r1, limit); break;
+        case 2: gu_rows<TY, 2>(blob, gu_row, up_off, n, act, ff, r0, r1, limit); break;
+        case 3: gu_rows<TY, 3>(blob, gu_row, up_off, n, act, ff, r0, r1, limit); break;
+        case 4: gu_rows<TY, 4>(blob, gu_row, up_off, n, act, ff, r0, r1, limit); break;
+        case 5: gu_rows<TY, 5>(blob, gu_row, up_off, n, act, ff, r0, r1, limit); break;
+        case 6: gu_rows<TY, 6>(blob, gu_row, up_off, n, act, ff, r0, r1, limit); break;
+        case 7: gu_rows<TY, 7>(blob, gu_row, up_off, n, act, ff, r0, r1, limit); break;
+        default: gu_rows<TY, 8>(blob, gu_row, up_off, n, act, ff, r0, r1, limit); break;
     }
 }
 
@@ -413,13 +422,18 @@ bool iq256_supported(int type) noexcept {
 
 void iq256_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, int nt,
                    float* const* ff, int r0, int r1) {
+    iq256_gu_rows_clamp(type, blob, gu_row, up_off, n, act, nt, ff, r0, r1, 0.0f);
+}
+
+void iq256_gu_rows_clamp(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, int nt,
+                   float* const* ff, int r0, int r1, float limit) {
     switch (type) {
-        case 16: gu_rows_nt<16>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 17: gu_rows_nt<17>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 18: gu_rows_nt<18>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 21: gu_rows_nt<21>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 22: gu_rows_nt<22>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 23: gu_rows_nt<23>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 16: gu_rows_nt<16>(nt, blob, gu_row, up_off, n, act, ff, r0, r1, limit); break;
+        case 17: gu_rows_nt<17>(nt, blob, gu_row, up_off, n, act, ff, r0, r1, limit); break;
+        case 18: gu_rows_nt<18>(nt, blob, gu_row, up_off, n, act, ff, r0, r1, limit); break;
+        case 21: gu_rows_nt<21>(nt, blob, gu_row, up_off, n, act, ff, r0, r1, limit); break;
+        case 22: gu_rows_nt<22>(nt, blob, gu_row, up_off, n, act, ff, r0, r1, limit); break;
+        case 23: gu_rows_nt<23>(nt, blob, gu_row, up_off, n, act, ff, r0, r1, limit); break;
         default: break;
     }
 }
