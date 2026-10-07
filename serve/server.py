@@ -60,16 +60,9 @@ from serve.structured import StructuredOutputError, prepare_format, validated_js
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 
-IM_END = "<|im_end|>"
-IMAGE_PAD = "<|image_pad|>"
-# #458: the trailing effort turn ("effort_position": "end"); low is the template's own sentence, medium (which the
-# template says nothing for: no xhigh sentence is medium there) says it, since the xhigh one stays at the top
-EFFORT_TURN = "<|im_start|>system\n{}<|im_end|>\n"
-EFFORT_TEXT = {"low": "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the "
-                      "conclusion without unnecessary elaboration.",
-               "medium": "Reasoning effort is set to medium. Think as much as the task needs, without unnecessary "
-                         "elaboration."}
-VISION_START = "<|vision_start|>"
+# the model family's text (ChatML for Qwen, GLM's own specials): serve/models.py; Qwen's constants stay importable here
+from serve.models import (EFFORT_TEXT, EFFORT_TURN, IM_END, IMAGE_PAD, QWEN, VISION_START,  # noqa: E402,F401
+                          ModelProfile, profile_for)
 # #606: a reply that repeats one token this many times in a row is ended there ("length"): a model in a loop, or a
 # broken state that answers one token forever (an issue saw 36,689 tokens of "!"). The config's "repeat_stop_tokens"
 # sets it; 0 turns it off.
@@ -104,9 +97,12 @@ class MockEngine:
     """Replays a scripted completion (text) as token ids, one per step, then the end-of-turn token.  Given a list of
     scripts, each request gets the next one and the last one repeats (a tool call, then the answer after it)."""
 
-    def __init__(self, tokenizer, script: str | list[str], max_context: int = 32768, delay_s: float = 0.0):
+    def __init__(self, tokenizer, script: str | list[str], max_context: int = 32768, delay_s: float = 0.0,
+                 end: str | None = None):
+        """`end`: the end-of-turn text appended to each script (default: the tokenizer's family's - <|im_end|> for
+        Qwen, <|user|> for GLM)."""
         self.tok, self.max_context, self.delay = tokenizer, max_context, delay_s
-        end = tokenizer.encode(IM_END, parse_special=True)
+        end = tokenizer.encode(end or profile_for(tokenizer).mock_end, parse_special=True)
         self.scripts = [tokenizer.encode(x, parse_special=True) + end for x in ([script] if isinstance(script, str)
                                                                                  else script)]
         self.script, self.turns = self.scripts[0], 0
@@ -397,6 +393,7 @@ class StrataEngine:
     engine's default, which is greedy; `temperature=0` means the same thing, so it is not forwarded.
     """
     silence_s = ENGINE_SILENCE_S         # #481: main() sets the config's engine_silence_s (survives restart())
+    eos_ids = EOS_IDS                    # the ids that end a reply (main() sets GLM's; the engine gets --eos-ids)
     silent_note = None                   # #481: why the server ended a silent engine (death_note says it)
     batch = 0                            # --batch: the engine's batch slots (0: one request at a time)
 
@@ -931,7 +928,7 @@ class StrataEngine:
                     if slot is None:
                         finish = (self.last or {}).get("finish") if isinstance(self.last, dict) else None
                         left = int(max_new) - len(out)
-                        if cancel.is_set() or left <= 0 or finish in ("stop", "length") or (out and out[-1] in EOS_IDS):
+                        if cancel.is_set() or left <= 0 or finish in ("stop", "length") or (out and out[-1] in self.eos_ids):
                             return
                         prompt = list(ids) + out            # promoted: it continues in a batch slot from here
                 while True:
@@ -1032,7 +1029,7 @@ class StrataEngine:
                         # what the slot's sessions hold now: the prompt and every token fed (all but the last one)
                         self.slot_held[slot] = list(prompt) + out[gen0:-1] if len(out) > gen0 else []
                         if (going_solo and f[3:4] == ["cancel"] and not cancel.is_set() and len(out) < int(max_new)
-                                and not (out and out[-1] in EOS_IDS)):
+                                and not (out and out[-1] in self.eos_ids)):
                             # the solo path continues it: the engine copies the slot's sessions back (all but the
                             # last token are in them) and decodes with MTP drafts again
                             self.slot_live[slot] = None
@@ -1389,22 +1386,27 @@ def gpu_list(cfg: dict) -> list[int]:
     return [int(str(x).strip()) for x in items if str(x).strip() != ""]
 
 
-def effort_end_args(cfg: dict, exe: str, tok) -> list[str] | None:
+def effort_end_args(cfg: dict, exe: str, tok, profile: ModelProfile = QWEN) -> list[str] | None:
     """#458 (opt-in): the engine arguments for "effort_position": "end" - the id of "system" as --tail-role-token, so
     the engine checkpoints in front of the trailing effort turn - or None when the config leaves it at the top (the
     default) or the engine is too old for it (said once; the prompt stays the default one).  ValueError for a value
-    other than "start" / "end"."""
+    other than "start" / "end".  A family without a tail role (GLM, serve/models.py) keeps the effort at the top."""
     pos = cfg.get("effort_position", "start")
     if pos not in ("start", "end"):
         raise ValueError(f'"effort_position" must be "start" (the default) or "end", not {pos!r}')
     if pos == "start":
+        return None
+    if profile.tail_role is None:
+        print(f"[strata] effort_position \"end\" is not available for {profile.arch} yet (the engine's "
+              "--tail-role-token expects ChatML's turn header): the reasoning effort stays at the top of the prompt",
+              flush=True)
         return None
     try:
         with open(exe, "rb") as f:
             known = b"--tail-role-token" in f.read()
     except OSError:
         known = False
-    role = tok.encode("system", parse_special=True)
+    role = tok.encode(profile.tail_role, parse_special=True)
     if not known or len(role) != 1:
         print("[strata] effort_position \"end\" needs engine 0.1.39 or newer (--tail-role-token): the reasoning "
               "effort stays at the top of the prompt", flush=True)
@@ -1618,6 +1620,13 @@ class ByteTokenizer:
         return raw.decode("utf-8", errors=errors)
 
 
+class GlmByteTokenizer(ByteTokenizer):
+    """ByteTokenizer with GLM-5.3-Flash's specials (serve/models.py's GLM profile is chosen by `pre`)."""
+    SPECIALS = ["[gMASK]", "<sop>", "<|system|>", "<|user|>", "<|assistant|>", "<|observation|>", "<|endoftext|>",
+                "<|begin_of_image|>", "<|image|>", "<|end_of_image|>"]
+    pre = "glm4"
+
+
 # ------------------------------------------------------------------------------------------------ core
 class Detokenizer:
     """Incremental decode: each token's bytes go through an incremental UTF-8 decoder, which emits the complete
@@ -1648,9 +1657,12 @@ class Detokenizer:
 
 
 class Service:
-    def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
+    def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str | None = None,
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
-                 fit_max_tokens: bool = False):
+                 fit_max_tokens: bool = False, profile: ModelProfile | None = None):
+        # the model family (serve/models.py): from the tokenizer unless given; Qwen's for every tokenizer before GLM
+        self.profile = profile or profile_for(tokenizer)
+        model_name = self.profile.model_name if model_name is None else model_name
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
@@ -1706,8 +1718,7 @@ class Service:
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
-        self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
-                            tokenizer.encode("<|endoftext|>", parse_special=True))
+        self.stop_ids = self.profile.stop_ids(tokenizer)   # Qwen: <|im_end|>, <|endoftext|>
 
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
@@ -1911,7 +1922,7 @@ class Service:
 
     def set_shared(self, defaults) -> dict:
         """The Chat settings every client gets for what it leaves out; {} / None = clients use their own again."""
-        self.shared = clean_shared_defaults(defaults)
+        self.shared = clean_shared_defaults(defaults, self.profile.shared_efforts)
         if self.shared_path:
             try:
                 if self.shared:
@@ -2119,6 +2130,8 @@ class Service:
         thinking) is rendered as a default one up to the answer - the same prompt start, so the conversation cache
         keeps it - and its effort follows in a short system turn right before the answer (thinking off: the template's
         empty thinking block).  The engine (--tail-role-token) checkpoints in front of that turn."""
+        if self.profile.close_think:
+            return self._render_closing(messages, tools, kwargs)
         effort = kwargs.get("reasoning_effort")
         off = kwargs.get("enable_thinking") is False
         if not self.effort_end or (not off and effort in (None, "", "xhigh", "high")):
@@ -2131,6 +2144,30 @@ class Service:
             return full
         tail = "" if off else EFFORT_TURN.format(EFFORT_TEXT.get(effort, EFFORT_TEXT["medium"]))
         return history + tail + full[len(mine):]
+
+    def _render_closing(self, messages, tools, kwargs) -> str:
+        """render_prompt for a template without enable_thinking whose generation prompt opens the thinking (GLM:
+        `<|assistant|><think>`): thinking off closes it (`<think></think>`, as the template writes an assistant turn
+        without reasoning), so the model answers at once and the parser starts in the answer.  With `effort_end`
+        (#458) a non-default effort is rendered as the default (Max) up to the answer, then its turn
+        (`<|system|>Reasoning Effort: Low`) right before `<|assistant|>`."""
+        p = self.profile
+        effort = kwargs.get("reasoning_effort")
+        off = kwargs.get("enable_thinking") is False
+        base = {k: v for k, v in kwargs.items() if k not in ("reasoning_effort", "enable_thinking")}
+        mine = {k: v for k, v in kwargs.items() if k != "enable_thinking"}
+        prompt = None
+        if self.effort_end and (off or effort not in p.efforts.default):
+            history = self.template.render(messages, tools=tools, add_generation_prompt=False, **base)
+            full = self.template.render(messages, tools=tools, add_generation_prompt=True, **base)
+            if full.startswith(history):            # else a template this cannot take apart: rendered as asked
+                tail = "" if off else p.effort_turn.format(p.effort_text.get(effort, effort))
+                prompt = history + tail + full[len(history):]
+        if prompt is None:
+            prompt = self.template.render(messages, tools=tools, **mine)
+        if off and prompt.endswith("<think>"):
+            prompt += "</think>"
+        return prompt
 
     def encode_prompt(self, messages, tools, kwargs) -> list[int]:
         """The request's prompt: the template rendered and tokenized.  #537: a <think> / </think> written inside a
@@ -2152,8 +2189,8 @@ class Service:
             if self.vision is None:
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
                                  "'vision'), so it cannot read images")
-            pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
-            start = self.tok.encode(VISION_START, parse_special=True)[0]
+            pad = self.tok.encode(self.profile.image_pad, parse_special=True)[0]
+            start = self.tok.encode(self.profile.vision_start, parse_special=True)[0]
             # Encode only while the engine is idle: the engine and the image encoder (a separate process) must not
             # run on the GPU at the same time - an encode during a running request left that request stuck at
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
@@ -2163,7 +2200,7 @@ class Service:
             # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
             # (right after <|vision_start|>) are images: the same text inside a message (an agent reading these docs,
             # #150) is kept as plain text, or it took an image's place and the counts no longer matched.
-            literal = self.tok.encode(IMAGE_PAD, parse_special=False)
+            literal = self.tok.encode(self.profile.image_pad, parse_special=False)
             out, k = [], 0
             for j, t in enumerate(ids):
                 if t == pad and j > 0 and ids[j - 1] == start and k < len(encoded):
@@ -2248,7 +2285,7 @@ class Service:
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
-        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
+        parser = self.profile.parser(thinking=thinking, tools=tools, stream_tools=True)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
@@ -3360,7 +3397,7 @@ def make_handler(svc: Service):
 
         def _openai(self, req):
             req = svc.with_shared(req, "openai")
-            messages, tools, kw = openai_to_messages(req)
+            messages, tools, kw = openai_to_messages(req, svc.profile.efforts)
             messages, validator = prepare_format(req.get("response_format"), messages)
             if validator is not None and (tools or req.get("strata_mcp")):
                 raise ValueError("structured response_format with tools/MCP is not supported")
@@ -3501,7 +3538,7 @@ def make_handler(svc: Service):
             responses_api.check_request(req)
             messages = responses_api.input_messages(req)
             tools, names, skipped = responses_api.request_tools(req)
-            kw = responses_api.template_kwargs(req, svc.shared)
+            kw = responses_api.template_kwargs(req, svc.shared, svc.profile.efforts)
             try:
                 messages, validator = prepare_format(responses_api.text_format(req), messages)
             except ValueError as e:
@@ -3539,13 +3576,13 @@ def make_handler(svc: Service):
             """Anthropic's token count, which Claude Code asks for its context figures: the prompt this server would
             read for the same request, rendered and tokenized - the model does not run."""
             req = svc.with_shared(req, "anthropic")
-            messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
+            messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked, svc.profile.efforts)
             self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw))})
 
         def _anthropic(self, req):
             svc.load()
             req = svc.with_shared(req, "anthropic")
-            messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
+            messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked, svc.profile.efforts)
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
@@ -3800,8 +3837,9 @@ def origins_of(value, key: str, wildcard: bool) -> list[str]:
 SHARED_KEYS = ("reasoning_effort", "temperature", "top_p", "top_k", "seed", "max_tokens", "experimental_speed_projection")
 
 
-def clean_shared_defaults(d) -> dict:
-    """The Chat settings other apps get (POST /settings): only known keys, each checked; ValueError names a bad one."""
+def clean_shared_defaults(d, efforts=("none", "low", "medium", "high")) -> dict:
+    """The Chat settings other apps get (POST /settings): only known keys, each checked; ValueError names a bad one.
+    `efforts`: the reasoning_effort values the model family takes (GLM also "max", serve/models.py)."""
     if d is None:
         return {}
     if not isinstance(d, dict):
@@ -3812,8 +3850,8 @@ def clean_shared_defaults(d) -> dict:
             continue
         number = isinstance(value, (int, float)) and not isinstance(value, bool)
         if key == "reasoning_effort":
-            if value not in ("none", "low", "medium", "high"):
-                raise ValueError("reasoning_effort: none, low, medium or high")
+            if value not in efforts:
+                raise ValueError("reasoning_effort: " + ", ".join(efforts[:-1]) + " or " + efforts[-1])
         elif key == "temperature":
             if not number or not 0 <= value <= 2:
                 raise ValueError("temperature: 0..2")
@@ -3951,13 +3989,15 @@ def main() -> int:
         ap.error(f"the model's tokenizer is missing ({tpath / 'vocab.json'}); run setup again")
     if (tpath / "vocab.json").exists():
         import strata_tokenizer as ST
-        vocab = json.loads((tpath / "vocab.json").read_text(encoding="utf-8"))
-        tokens = [None] * len(vocab)
-        for t, i in vocab.items():
-            tokens[i] = t
-        merges = (tpath / "merges.txt").read_text(encoding="utf-8").split("\n")
-        types = json.loads((tpath / "token_type.json").read_text())
-        tok = ST.Tokenizer(tokens, merges, types)
+        # the pack's pre-tokenizer (tokenizer.json "pre": qwen35, or glm4 for GLM-5.3-Flash) and special ids; a Qwen
+        # pack's directory tokenizes exactly as the old (tokens, merges, types) construction did
+        tok = ST.Tokenizer.from_dir(tpath)
+    try:
+        profile = profile_for(tok, cfg.get("arch"))     # the model family: Qwen, or GLM for a glm4 tokenizer
+    except ValueError as e:
+        raise SystemExit(f"[strata] config {e}")
+    if profile is not QWEN:
+        print(f"[strata] model family {profile.arch} (the pack's tokenizer: {getattr(tok, 'pre', '?')})", flush=True)
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
     if a.engine == "strata":
         if not cfg:
@@ -3995,11 +4035,17 @@ def main() -> int:
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
         try:
-            effort_end = effort_end_args(cfg, exe, tok)  # #458
+            effort_end = effort_end_args(cfg, exe, tok, profile)  # #458
+            eargs = engine_args(cfg)
+            family = profile.engine_args(tok, eargs)    # GLM: --eos-ids, --turn-token (Qwen: none)
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
-        engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
+        if family:
+            print(f"[strata] {profile.arch}: engine arguments {' '.join(family)}", flush=True)
+        engine = StrataEngine(exe, eargs + family + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
                               env=env, lazy=lazy)
+        if profile is not QWEN:
+            engine.eos_ids = profile.stop_ids(tok)      # the ids that end a reply (Qwen: EOS_IDS, the class's)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
         warn_tight_ram(engine.info.get("arena_mib"))
         note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],
@@ -4009,13 +4055,13 @@ def main() -> int:
     else:
         effort_end = None
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
-            "Thinking about it.</think>\n\nHello from the mock engine."]), None, {}
+            "Thinking about it.</think>\n\nHello from the mock engine."], end=profile.mock_end), None, {}
     # the model's own chat template (exported with its tokenizer), else the original model's
     tpl = tpath / "chat_template.jinja"
-    svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
-                  model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
+    svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve" / profile.template),
+                  model_name=cfg.get("model_name", profile.model_name), vision=vision,
                   sampling_defaults=sampling_defaults,
-                  fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
+                  fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True, profile=profile)
     try:
         svc.set_aliases(cfg.get("aliases"))             # #297: other names the model answers to
     except ValueError as e:
@@ -4077,7 +4123,8 @@ def main() -> int:
     if a.config:                                        # the Chat settings shared with other apps, from last time
         svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"
         try:
-            svc.shared = clean_shared_defaults(json.loads(Path(svc.shared_path).read_text(encoding="utf-8")))
+            svc.shared = clean_shared_defaults(json.loads(Path(svc.shared_path).read_text(encoding="utf-8")),
+                                               svc.profile.shared_efforts)
             if svc.shared:
                 print("[strata] other apps use the Chat settings: " +
                       ", ".join(f"{k}={v}" for k, v in svc.shared.items()), flush=True)
