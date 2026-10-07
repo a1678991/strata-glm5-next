@@ -66,6 +66,7 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -258,13 +259,19 @@ int glm_serve(const GlmServeParts& P) {
         return true;
     };
 
-    // ---- stdin on its own thread, so a STOP reaches a running request (generate.cpp's reader: read(2), not cin)
-    std::atomic<bool> stop_req{false};
-    std::mutex in_mu;
-    std::condition_variable in_cv;
-    std::deque<std::string> in_lines;
-    bool in_eof = false;
-    std::thread([&] {
+    // ---- stdin on its own thread, so a STOP reaches a running request (generate.cpp's reader: read(2), not cin).
+    // The thread is detached and outlives this function (it may still be in read(2) at QUIT): what it touches is
+    // shared with it, never this frame's locals.
+    struct Input {
+        std::atomic<bool> stop{false};
+        std::mutex mu;
+        std::condition_variable cv;
+        std::deque<std::string> lines;
+        bool eof = false;
+    };
+    const auto in = std::make_shared<Input>();
+    std::atomic<bool>& stop_req = in->stop;
+    std::thread([in] {
         std::string l, buf;
         char chunk_buf[4096];
         auto getline_fd = [&](std::string& out) -> bool {
@@ -292,21 +299,21 @@ int glm_serve(const GlmServeParts& P) {
         };
         while (getline_fd(l)) {
             if (!l.empty() && l.back() == '\r') l.pop_back();
-            if (l == "STOP") { stop_req.store(true); continue; }
-            std::lock_guard<std::mutex> lk(in_mu);
-            in_lines.push_back(l);
-            in_cv.notify_one();
+            if (l == "STOP") { in->stop.store(true); continue; }
+            std::lock_guard<std::mutex> lk(in->mu);
+            in->lines.push_back(l);
+            in->cv.notify_one();
         }
-        std::lock_guard<std::mutex> lk(in_mu);
-        in_eof = true;
-        in_cv.notify_one();
+        std::lock_guard<std::mutex> lk(in->mu);
+        in->eof = true;
+        in->cv.notify_one();
     }).detach();
     auto next_line = [&](std::string& out) -> bool {
-        std::unique_lock<std::mutex> lk(in_mu);
-        in_cv.wait(lk, [&] { return !in_lines.empty() || in_eof; });
-        if (in_lines.empty()) return false;
-        out = std::move(in_lines.front());
-        in_lines.pop_front();
+        std::unique_lock<std::mutex> lk(in->mu);
+        in->cv.wait(lk, [&] { return !in->lines.empty() || in->eof; });
+        if (in->lines.empty()) return false;
+        out = std::move(in->lines.front());
+        in->lines.pop_front();
         return true;
     };
 
