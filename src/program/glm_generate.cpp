@@ -49,7 +49,9 @@
 #include "strata/artifact/gguf_split.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_source.hpp"
+#include "strata/core/conversation_disk.hpp"
 #include "strata/core/glm.hpp"
+#include "strata/core/glm_conversation.hpp"
 #include "strata/core/glm_experts.hpp"
 #include "strata/core/glm_pool.hpp"
 #include "strata/core/native_dense.hpp"
@@ -65,11 +67,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <set>
 #include <sstream>
 #include <string>
 #include <vector>
+
+#include <unistd.h>
 
 namespace strata::program {
 namespace {
@@ -143,6 +148,54 @@ std::string vram_shortfall(const sc::ModelGeometry& g, const sc::GlmConfig& cfg,
                  slots > 0 ? ("--kv-resident " + std::to_string((long long) cfg.kv_resident)).c_str()
                            : "every cell resident", staging_mib, prompt_mib, reserve_mib);
     return b;
+}
+
+// STRATA_GLM_SPLIT_RESTORE: the session after ids[0, n) parked (RAM: the image itself; disk: written to a fresh
+// ConversationDisk directory and read back through its index), the session dirtied (reset, then 8 junk windows that
+// write KDA state and DSA cells 0..7), and the image restored.
+bool split_park_restore(sc::GlmEngine& eng, const std::vector<int32_t>& ids, int64_t n, const std::string& how,
+                        std::string& err) {
+    const sc::GlmSessionView view = eng.session_view();
+    std::vector<int32_t> live(ids.begin(), ids.begin() + n);
+    const std::vector<sc::ConversationImageKey> no;
+    const std::vector<sc::ConversationCheckpoint> chain;
+    sc::SavedConversation image;
+    if (!sc::glm_snapshot_save(image, sc::ConversationView{live, no, chain, true}, view, err)) return false;
+    if (how == "disk") {
+        const std::string dir = std::filesystem::temp_directory_path().string() + "/glm_split_restore_" +
+                                std::to_string((long long) getpid());
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+        {
+            sc::ConversationDisk d;
+            if (!d.open(dir, "split-restore", 0, err) || !d.store(image, err)) return false;
+        }
+        std::vector<int32_t> prompt = live;   // a prompt that continues the parked session
+        prompt.push_back(0);
+        sc::SavedConversation back;
+        sc::ConversationDisk d2;               // the directory reopened: the entry found through its index
+        if (!d2.open(dir, "split-restore", 0, err)) return false;
+        const auto m2 = d2.best(prompt, no, true);
+        if (m2.tokens != n || !d2.load(m2, prompt, no, back, err)) {
+            if (err.empty()) err = "the disk tier did not offer the parked session";
+            return false;
+        }
+        std::filesystem::remove_all(dir, ec);
+        image = std::move(back);
+    } else if (how != "ram") {
+        err = "STRATA_GLM_SPLIT_RESTORE is ram or disk";
+        return false;
+    }
+    if (!eng.reset(err)) return false;
+    for (int i = 0; i < 8; ++i) {
+        const int32_t junk = 1000 + 37 * i;
+        if (!eng.run(1, &junk, i, err) || !eng.commit(1, err)) return false;
+    }
+    if (sc::glm_snapshot_restore(image, view, err) != sc::ConversationRestore::restored) return false;
+    std::fprintf(stderr, "strata generate: glm5-next: STRATA_GLM_SPLIT_RESTORE=%s: the session after %lld tokens parked "
+                         "(%.1f MiB), dirtied and restored\n", how.c_str(), (long long) n,
+                 (double) image.bytes() / 1048576.0);
+    return true;
 }
 
 }  // namespace
@@ -529,7 +582,21 @@ int glm_generate(const GlmRunArgs& a) {
         if (const char* v = std::getenv("STRATA_GLM_PREFILL_LOGPOS"); v != nullptr && *v)
             n_logits = std::max(1, std::min(T, std::atoi(v)));
         n_logits = (int) std::min<int64_t>(n_logits, P);
-        if (!prefill.run(ids.data(), P, 0, full ? n_logits : 0, err)) return fail(err);
+        // STRATA_GLM_PREFILL_SPLIT=a (wave 6): the prompt path reads [0, a) and then [a, P) as a second call at pos0 = a
+        // (a serve request continuing a conversation); STRATA_GLM_SPLIT_RESTORE=ram|disk parks the session after the
+        // first part (glm_conversation.hpp), dirties it (a reset and junk windows), and restores it before the second:
+        // the rows after P must be byte-identical to the split without the restore
+        int64_t split = 0;
+        if (const char* v = std::getenv("STRATA_GLM_PREFILL_SPLIT"); v != nullptr && *v) split = std::atoll(v);
+        if (split > 0 && split < P) {
+            if (!prefill.run(ids.data(), split, 0, 0, err)) return fail(err);
+            if (const char* r = std::getenv("STRATA_GLM_SPLIT_RESTORE"); r != nullptr && *r) {
+                if (!split_park_restore(eng, ids, split, r, err)) return fail(err);
+            }
+            if (!prefill.run(ids.data() + split, P - split, split, full ? n_logits : 0, err)) return fail(err);
+        } else if (!prefill.run(ids.data(), P, 0, full ? n_logits : 0, err)) {
+            return fail(err);
+        }
         last_rows = n_logits;
         prefill_s = std::chrono::duration<double>(Clock::now() - tp).count();
         if (full) {   // the prompt's last positions: the rows the windows would have written for them
