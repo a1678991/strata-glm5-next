@@ -3,6 +3,8 @@
 // preflight (header, geometry, tensor directory, the pack's expert spans).
 #pragma once
 
+#include "strata/kernels/cpu/pool.hpp"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -27,6 +29,11 @@ struct GlmRunArgs {
     int64_t prefill_until = 0;         ///< --prefill-until P: the prompt path reads [0, P), windows the rest (0: all
                                        ///< tokens but the last)
     int64_t max_new = 0;               ///< --max-new K: greedy tokens generated after the last one (0: none)
+    // the CPU expert pool for the RAM tier's experts (glm_pool.hpp; STRATA_GLM_POOL=0 stages them to the GPU instead)
+    int pool_tasks = 0;                ///< --pool-tasks (0: three row tasks per participating thread)
+    int pool_workers = 0;              ///< --pool-workers (0: every physical core but the host's)
+    bool no_host_worker = false;       ///< --no-host-worker
+    strata::kernels::cpu::PoolAffinity pool_affinity = strata::kernels::cpu::PoolAffinity::All;   ///< --pool-affinity
 };
 
 /// Runs it; the process exit code.

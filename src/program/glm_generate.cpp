@@ -37,6 +37,10 @@
 //                             latents, key | gate rows and pooled rows; STRATA_GLM_STATE_AT=P sets P for a run
 //                             without the prompt path (the windows then stop at P once), to compare the two
 //   STRATA_GLM_PREFILL_TIMING=1   the prompt path's GPU time per phase
+//
+// The RAM tier's experts are computed by the CPU expert pool (include/strata/core/glm_pool.hpp; --pool-workers,
+// --pool-affinity, --no-host-worker as on the Qwen path; the host thread is pinned to the first physical core while the
+// windows run); STRATA_GLM_POOL=0 copies them into VRAM staging and computes them on the GPU instead (the A/B arm).
 #include "strata/program/glm_generate.hpp"
 
 #include "strata/artifact/gguf_reader.hpp"
@@ -45,6 +49,7 @@
 #include "strata/core/expert_source.hpp"
 #include "strata/core/glm.hpp"
 #include "strata/core/glm_experts.hpp"
+#include "strata/core/glm_pool.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -148,6 +153,8 @@ int glm_generate(const GlmRunArgs& a) {
     sc::FileExpertSource src;
     sc::ExpertCache cache;
     sc::GlmExperts experts;
+    std::unique_ptr<strata::kernels::cpu::ExpertPool> cpu_pool;
+    sc::GlmPool glm_pool;
     std::vector<std::pair<int32_t, int32_t>> ranked;
     if (any_moe) {
         src.set_gguf(a.native);
@@ -208,6 +215,16 @@ int glm_generate(const GlmRunArgs& a) {
             std::fprintf(stderr, "strata generate: glm5-next: RAM tier %.2f GiB (%s), the rest from the file tier\n",
                          (double) src.resident_bytes() / 1073741824.0,
                          src.complement_pinned() ? "page-locked" : "pageable");
+        }
+        const char* pv = std::getenv("STRATA_GLM_POOL");
+        if (src.resident_bytes() > 0 && !(pv != nullptr && std::atoi(pv) == 0)) {
+            cpu_pool = std::make_unique<strata::kernels::cpu::ExpertPool>(a.pool_workers, /*pin=*/true,
+                                                                          /*host_works=*/!a.no_host_worker,
+                                                                          a.pool_affinity, a.pool_tasks);
+            if (!glm_pool.init(g, cpu_pool.get(), T, (int) g.n_expert_used, err)) return fail(err);
+            experts.set_pool(&glm_pool);
+            std::fprintf(stderr, "strata generate: glm5-next: RAM-tier experts on the CPU pool, %d threads (%d workers%s)\n",
+                         glm_pool.workers(), cpu_pool->workers(), cpu_pool->host_works() ? " + the host thread" : "");
         }
         if (!experts.init(g, cache.valid() ? &cache : nullptr, &src, T, err)) return fail(err);
     }
@@ -366,6 +383,18 @@ int glm_generate(const GlmRunArgs& a) {
         std::fprintf(stderr, "strata generate: glm5-next: prompt path: %lld tokens in %.2f s: %.1f tok/s\n",
                      (long long) P, prefill_s, (double) P / prefill_s);
         if (!dump_state_at(P)) return fail(err);
+    }
+    // the pool's workers stay off its reserved core (the first physical one, or the last with --host-core last); the
+    // host loop takes it, as session.cpp's SessionLoopScratch does
+    struct HostPin {
+        strata::kernels::cpu::ThreadAffinity prev;
+        ~HostPin() { if (prev.valid) strata::kernels::cpu::restore_thread_affinity(prev); }
+    } host_pin;
+    if (glm_pool.ready()) {
+        const int host_core = strata::kernels::cpu::planned_host_core(a.pool_affinity);
+        const std::vector<int> cores = strata::kernels::cpu::physical_cores(false);
+        if (host_core >= 0) host_pin.prev = strata::kernels::cpu::pin_current_thread(host_core);
+        else if (!cores.empty()) host_pin.prev = strata::kernels::cpu::pin_current_thread(cores[0]);
     }
     const auto t0 = Clock::now();
     for (int64_t q = P; q < n;) {

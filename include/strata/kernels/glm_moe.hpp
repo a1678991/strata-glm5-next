@@ -6,11 +6,17 @@
 //
 // Every product and sum is rounded to f32 on its own (no fused multiply-add), as the separate ggml ops do.
 // parts [T][k][n_embd], w [T][k], shared / out [T][n_embd]: device F32, the caller's stream, no allocation.
+//
+// The CPU pool's rows (GlmPool, src/core/glm_pool.hpp): with cpu_rows and cpu_map given, the row of entry t * k + j is
+// cpu_rows[cpu_map[t * k + j]] when that index is >= 0 (an expert the CPU computed) and parts[t][j] otherwise.  The
+// sums are the same expression either way; without them it is the GPU-only combine above.
 #pragma once
+
+#include <cstdint>
 
 namespace strata::kernels {
 
 void glm_moe_combine(const float* parts, const float* w, const float* shared, float* out, int n_embd, int k, int n_tok,
-                     void* stream);
+                     void* stream, const float* cpu_rows = nullptr, const int32_t* cpu_map = nullptr);
 
 }  // namespace strata::kernels
