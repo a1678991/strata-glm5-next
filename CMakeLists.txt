@@ -409,6 +409,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     endforeach()
   endif()
 
+  # GLM-5.3-Flash's DSA layer kernels and their parity tests (a library of their own: cmake/strata_dsa.cmake)
+  include(cmake/strata_dsa.cmake)
+
   # ---- strata_engine (P2.S5) -----------------------------------------------------
   # The COMPOSED layer lives here and not in `strata_core`, because it calls kernels and `strata_kernels`
   # already links `strata_core` - putting `gdn_layer` in core would make the two mutually dependent.  A third
