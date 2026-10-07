@@ -315,6 +315,7 @@ struct Options {
     std::string pack = "pack/full";
     std::vector<int64_t> tokens;      // the prompt, PRE-TOKENIZED
     int64_t max_new = 16;
+    bool max_new_given = false;   ///< glm5-next: --max-new on the command line (its run generates only then)
     int64_t max_context = 4096;
     bool greedy = true;
     uint64_t seed = 0;
@@ -1675,7 +1676,7 @@ int main(int argc, char** argv) {
             }
             have_tokens = true;
         }
-        else if (a == "--max-new") o.max_new = std::atoll(next("--max-new"));
+        else if (a == "--max-new") { o.max_new = std::atoll(next("--max-new")); o.max_new_given = true; }
         else if (a == "--max-context") o.max_context = std::atoll(next("--max-context"));
         else if (a == "--rope-scaling") o.rope_scaling = next("--rope-scaling");
         else if (a == "--rope-scale") o.rope_scale = std::atof(next("--rope-scale"));
@@ -1996,6 +1997,10 @@ int main(int argc, char** argv) {
         glm.resident_pin = o.resident_pin;
         glm.resident_headroom = o.resident_headroom;
         glm.stats = o.stats;
+        glm.prefill_chunk = o.prefill_chunk;
+        glm.prefill_auto = o.prefill_auto;
+        glm.prefill_until = o.prefill_until;
+        glm.max_new = o.max_new_given ? o.max_new : 0;
         if (const int rc = glm5_next_preflight(o.native_preset, o.pack, &glm); rc >= 0) return rc;
     }
 #if defined(STRATA_USE_HIP)
