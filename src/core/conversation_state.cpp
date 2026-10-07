@@ -1,4 +1,5 @@
 #include "strata/core/conversation_snapshot.hpp"
+#include "strata/core/glm_conversation.hpp"
 #include "conversation_checked.hpp"
 
 #include <algorithm>
@@ -11,6 +12,9 @@ using conversation_detail::add;
 using conversation_detail::product;
 
 std::array<int64_t, 18> geometry_key(const ModelGeometry& g) {
+    // glm5-next: the architecture-tagged key, so a GLM image never validates against a Qwen session (and the
+    // reverse); the Qwen key below is unchanged, so Qwen's saved images stay valid
+    if (g.glm()) return glm_conversation_key(g);
     return {g.n_embd, g.n_layers, g.qsa_interval, g.ssm_state_size, g.ssm_k_heads,
             g.ssm_v_heads, g.ssm_d_conv, g.ssm_conv_channels, g.ssm_value_dim,
             g.n_head, g.n_head_kv, g.head_dim, g.idx_q_heads, g.idx_key_dim,
