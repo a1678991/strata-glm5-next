@@ -255,4 +255,30 @@ void kda_step_commit(float* state, const float* h, const float* fb, const float*
     check_launch("kda_step_commit");
 }
 
+void kda_conv_l2_prompt(float* history, const float* qkv, const float* conv_wq, const float* conv_wk,
+                        const float* conv_wv, float* h, const KdaShape& shape, int64_t n_tok, void* stream) {
+    check_shape(shape, "kda_conv_l2_prompt");
+    if (!history || !qkv || !conv_wq || !conv_wk || !conv_wv || !h || n_tok < 1 || n_tok > (1 << 24))
+        throw std::invalid_argument("kda_conv_l2_prompt: null buffer or n_tok outside 1..2^24");
+    const float n = (float) S;
+    const float l2_eps_n = shape.l2_eps / n, inv_sqrt_n = 1.0f / sqrtf(n);
+    kda_conv_l2_kernel<true><<<dim3((unsigned) (3 * shape.n_head)), S, 0, (cudaStream_t) stream>>>(
+        history, qkv, conv_wq, conv_wk, conv_wv, h, shape.n_head, (int) n_tok, l2_eps_n, inv_sqrt_n);
+    check_launch("kda_conv_l2_prompt");
+}
+
+void kda_step_norm_prompt(float* state, const float* h, const float* fb, const float* dt_bias, const float* ssm_a,
+                          const float* b_raw, const float* gb, const float* o_norm_w, float* y, const KdaShape& shape,
+                          int64_t n_tok, void* stream) {
+    check_shape(shape, "kda_step_norm_prompt");
+    if (!state || !h || !fb || !dt_bias || !ssm_a || !b_raw || !gb || !o_norm_w || !y || n_tok < 1 ||
+        n_tok > (1 << 24))
+        throw std::invalid_argument("kda_step_norm_prompt: null buffer or n_tok outside 1..2^24");
+    const float scale = 1.0f / sqrtf((float) S);
+    kda_step_kernel<0><<<dim3((unsigned) shape.n_head), dim3(S, RG), 0, (cudaStream_t) stream>>>(
+        state, h, fb, dt_bias, ssm_a, b_raw, gb, o_norm_w, y, shape.n_head, (int) n_tok, nullptr,
+        shape.gate_lower_bound, shape.rms_eps, scale);
+    check_launch("kda_step_norm_prompt");
+}
+
 }  // namespace strata::kernels
