@@ -71,4 +71,17 @@ void kda_step_norm(float* state, const float* h, const float* fb, const float* d
 void kda_step_commit(float* state, const float* h, const float* fb, const float* dt_bias, const float* ssm_a,
                      const float* b_raw, const KdaShape& shape, const int32_t* n_keep, void* stream);
 
+/// The prompt path: the same kernels over a chunk of any number of tokens (>= 1) - the decode
+/// step's arithmetic token by token, so a chunk leaves exactly the history and state that its tokens read one at a
+/// time would (given the same inputs).  kda_conv_l2_prompt updates the history; `h` may be `qkv` itself (each value
+/// is read by the thread that then writes it).  kda_step_norm_prompt writes y for every token and the state after
+/// the last.  llama.cpp f1cee99 reads a prompt through the same sequential recurrence: its fused gated_delta_net
+/// (enabled on CPU and CUDA, llama-context.cpp 233-234, 564-565) walks the tokens one by one for any n_tokens
+/// (ggml-cpu ops.cpp 11124-11275, ggml-cuda gated_delta_net.cu), not the chunked form of build_delta_net_chunking.
+void kda_conv_l2_prompt(float* history, const float* qkv, const float* conv_wq, const float* conv_wk,
+                        const float* conv_wv, float* h, const KdaShape& shape, int64_t n_tok, void* stream);
+void kda_step_norm_prompt(float* state, const float* h, const float* fb, const float* dt_bias, const float* ssm_a,
+                          const float* b_raw, const float* gb, const float* o_norm_w, float* y, const KdaShape& shape,
+                          int64_t n_tok, void* stream);
+
 }  // namespace strata::kernels

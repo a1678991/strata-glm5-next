@@ -126,6 +126,24 @@ struct GlmConfig {
 /// recurrent state and its window record, every DSA layer's latent cache, and the shared per-window scratch.
 uint64_t glm_session_bytes(const ModelGeometry& g, const GlmConfig& cfg);
 
+/// The prompt path's view of a session (src/prefill/glm_prefill.cpp): the weights, the shapes and
+/// the state it reads and writes in place - every KDA layer's conv history and recurrent state, every DSA layer's
+/// latent cache - so the decode windows continue exactly where the prompt left them.  Device pointers.
+struct GlmSessionView {
+    const ModelGeometry* g = nullptr;
+    const GlmConfig* cfg = nullptr;
+    const std::vector<GlmLayerWeights>* w = nullptr;
+    const NativeEmbed* embed = nullptr;
+    strata::kernels::KdaShape kshape;
+    strata::kernels::MhcShape mshape;
+    strata::kernels::DsaShapes dshape;
+    std::vector<float*> kda_hist;                     ///< per layer: [3 * d_inner][d_conv - 1], null for DSA layers
+    std::vector<float*> kda_state;                    ///< per layer: [n_head][head_dim][head_dim]
+    std::vector<strata::kernels::DsaKvCache> dsa;     ///< per layer (unused rows for KDA layers)
+    void* stream = nullptr;                           ///< the session's stream
+    int64_t n_run = 0;
+};
+
 class GlmEngine {
 public:
     GlmEngine() = default;
@@ -162,6 +180,18 @@ public:
     /// Debugging: the intermediate nodes of `layer` - llama.cpp's names, one GLMT file each in `dir`: hc_mixes#0/#1,
     /// hc_attn_pre, attn_norm, kda_out or attn_out, hc_attn_post, hc_ffn_pre, ffn_norm, ffn_out (STRATA_GLM_NODES).
     bool set_node_dump(int64_t layer, const std::string& dir, std::string& err);
+
+    /// The prompt path: the session's state and weights (see GlmSessionView).
+    GlmSessionView session_view() const;
+    /// The head over `n` (1..max_t) rows of hyper-connection streams at `x_rows` (device, [n][hc][n_embd]): the logits
+    /// of the prompt's last positions pos0 .. pos0 + n - 1, read by copy_logits / argmax / window_logprobs like a
+    /// window's rows.  The KDA state is not touched, and there is no window to commit afterwards.
+    bool head_rows(const float* x_rows, int n, int64_t pos0, std::string& err);
+    /// Debugging and the prompt path's check: the session state after the first `n_cells` positions, one GLMT file per
+    /// tensor in `dir` - kda_hist-<l> (3 x d_inner rows of d_conv - 1), kda_state-<l> (n_head x head_dim rows of
+    /// head_dim), dsa_latent-<l> (n_cells rows of kv_lora, dequantized as the attention reads it), dsa_kg-<l>
+    /// (n_cells rows of key | gate), dsa_pooled-<l> (n_cells / kpool rows of idx_dim).  Layers [0, n_run).
+    bool dump_state(const std::string& dir, int64_t n_cells, std::string& err) const;
 
     bool head_runs() const { return head_ != nullptr && n_run_ == g_.n_layers; }
     int64_t n_run() const { return n_run_; }

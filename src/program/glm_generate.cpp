@@ -14,16 +14,29 @@
 //   STRATA_GLM_DUMP=<dir>     <dir>/l_out-<l>.glmt: the 4 hyper-connection streams after layer l, one row per token
 //                             (GLMT, docs/GLM.md "Diagnostics"; llama.cpp's l_out-<l> layout)
 //   STRATA_GLM_DUMP_LAYERS=a,b,...   only these layers (default: every layer that runs)
+//   STRATA_GLM_DUMP_FROM=P    only the rows of positions >= P (the prompt path's too)
 //   STRATA_GLM_LAYERS=N       run layers 0..N-1 only (no head unless N is the whole model): a stage's check
 //   STRATA_GLM_FROM=i, STRATA_GLM_INPUT=<file>   layers i..N-1 only, on the rows of <file> (llama.cpp's l_out-(i-1))
 //   STRATA_GLM_KV=f16         the DSA latent in f16 (the parity layout) instead of int8
-//   STRATA_GLM_LOGITS=<file> every position's full logits (GLMT)
+//   STRATA_GLM_LOGITS=<file> every position's full logits (GLMT); with
+//                             STRATA_GLM_LOGITS_FROM=P only positions >= P
 //   STRATA_GLM_PROFILE=1      per-layer GPU times
 //   STRATA_GLM_NODES=<dir>, STRATA_GLM_NODES_LAYER=l   the intermediate nodes of layer l (glm.hpp set_node_dump),
 //                             named as llama.cpp's eval-callback names them
 //   STRATA_GLM_MARK_EVERY=N, STRATA_GLM_MARKS=a,b,...   a timing line at every N-th token and at the listed
 //                             positions (the first window that reaches each): seconds since the first window, and the
 //                             tier counters so far (cumulative; differences between two marks give a segment's rate)
+//
+// The prompt path (--prefill N|auto; include/strata/prefill/glm_prefill.hpp): positions
+// [0, P) are read in chunks of N tokens (P = --prefill-until, default every token but the last), the rest through
+// the windows as above, teacher-forced; --max-new K then generates K greedy tokens (one window each) and prints
+// them as "GLM_GEN <ids>".
+//   STRATA_GLM_PREFILL_LOGPOS=L   STRATA_LOGPOS also gets the prompt's last L positions (1..max window, default 1:
+//                             the position whose logits pick the first token after the prompt)
+//   STRATA_GLM_STATE=<dir>    the session after position P (GlmEngine::dump_state): KDA history and state, DSA
+//                             latents, key | gate rows and pooled rows; STRATA_GLM_STATE_AT=P sets P for a run
+//                             without the prompt path (the windows then stop at P once), to compare the two
+//   STRATA_GLM_PREFILL_TIMING=1   the prompt path's GPU time per phase
 #include "strata/program/glm_generate.hpp"
 
 #include "strata/artifact/gguf_reader.hpp"
@@ -35,6 +48,7 @@
 #include "strata/core/native_dense.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/prefill/glm_prefill.hpp"
 
 #include <cuda_runtime.h>
 
@@ -88,7 +102,15 @@ int glm_generate(const GlmRunArgs& a) {
     if (n_run < 1 || n_run > g.n_layers) return fail("STRATA_GLM_LAYERS must be 1.." + std::to_string(g.n_layers));
     const bool full = n_run == g.n_layers;
     const int T = std::max(1, std::min(8, a.window));
-    const int64_t max_cells = std::max<int64_t>(a.max_context, (int64_t) a.tokens.size());
+    const int64_t max_cells = std::max<int64_t>(a.max_context, (int64_t) a.tokens.size() + std::max<int64_t>(0, a.max_new));
+    // the prompt path: positions [0, P) in chunks (--prefill N, or auto: 4,096 tokens, see glm_prefill.hpp)
+    const int64_t n_tok = (int64_t) a.tokens.size();
+    const int64_t pf_chunk = a.prefill_auto ? 4096 : a.prefill_chunk;
+    int64_t P = 0;
+    if (pf_chunk > 0) {
+        P = a.prefill_until > 0 ? std::min<int64_t>(a.prefill_until, n_tok) : std::max<int64_t>(1, n_tok - 1);
+        if (std::getenv("STRATA_GLM_FROM") != nullptr) return fail("STRATA_GLM_FROM does not combine with --prefill");
+    }
     const bool any_moe = n_run > g.n_dense_lead;
     if (!strata::kernels::cpu::expert_layout_load(a.pack, g.n_layers, g.n_expert, err, g.n_embd, g.n_ff,
                                                   g.n_dense_lead))
@@ -148,7 +170,10 @@ int glm_generate(const GlmRunArgs& a) {
             probe.max_cells = max_cells;
             const double session = (double) sc::glm_session_bytes(g, probe) / 1048576.0;
             const double staging = (double) T * g.n_expert_used * (double) lay.max_blob / 1048576.0;
-            double room = free_mib() - session - staging - 512.0 - (double) a.vram_reserve_mib;
+            probe.n_run = n_run;
+            const double prompt = P > 0 ? (double) strata::prefill::GlmPrefill::bytes_needed(
+                                              g, probe, std::min<int64_t>(pf_chunk, P)) / 1048576.0 : 0.0;
+            double room = free_mib() - session - staging - prompt - 512.0 - (double) a.vram_reserve_mib;
             want = 0;
             for (const auto& [l, e] : ranked) {
                 const double b = (double) lay.blob_bytes(l) / 1048576.0;
@@ -202,6 +227,17 @@ int glm_generate(const GlmRunArgs& a) {
                  cfg.kv_fmt == strata::kernels::kDsaLatF16 ? "f16" : "int8", (long long) n_run - 1,
                  full ? " and the head" : " (no head: STRATA_GLM_LAYERS)", free_mib());
 
+    strata::prefill::GlmPrefill prefill;
+    if (P > 0) {
+        if (!prefill.init(eng, cache.valid() ? &cache : nullptr, any_moe ? &src : nullptr, std::min<int64_t>(pf_chunk, P),
+                          err))
+            return fail(err);
+        std::fprintf(stderr, "strata generate: glm5-next: prompt path: positions 0-%lld in chunks of %lld tokens "
+                             "(%.1f MiB of buffers), the rest through windows; %.0f MiB of VRAM free\n",
+                     (long long) P - 1, (long long) prefill.chunk(), (double) prefill.device_bytes() / 1048576.0,
+                     free_mib());
+    }
+
     // ---- the dumps
     std::vector<std::unique_ptr<sc::GlmtWriter>> writers((size_t) g.n_layers);
     if (const char* dir = std::getenv("STRATA_GLM_DUMP"); dir != nullptr && *dir) {
@@ -220,6 +256,7 @@ int glm_generate(const GlmRunArgs& a) {
             if (!writers[(size_t) l]->create(std::string(dir) + "/" + name + ".glmt", name, g.n_embd, g.hc, err))
                 return fail(err);
             eng.set_dump(l, writers[(size_t) l].get());
+            prefill.set_dump(l, writers[(size_t) l].get());
         }
     }
     if (const char* dir = std::getenv("STRATA_GLM_NODES"); dir != nullptr && *dir) {
@@ -260,6 +297,8 @@ int glm_generate(const GlmRunArgs& a) {
     }
     // STRATA_GLM_LOGITS=<file>: every position's full logits (GLMT), for a full-vocab KLD
     std::unique_ptr<sc::GlmtWriter> logits_out;
+    int64_t logits_from = 0;   // STRATA_GLM_LOGITS_FROM=P: only the rows of positions >= P
+    if (const char* v = std::getenv("STRATA_GLM_LOGITS_FROM"); v != nullptr && *v) logits_from = std::atoll(v);
     std::vector<float> lrow;
     if (const char* p = std::getenv("STRATA_GLM_LOGITS"); p != nullptr && *p) {
         if (!full) return fail("STRATA_GLM_LOGITS needs the whole model");
@@ -267,12 +306,24 @@ int glm_generate(const GlmRunArgs& a) {
         if (!logits_out->create(p, "logits", g.n_vocab, 1, err)) return fail(err);
         lrow.resize((size_t) g.n_vocab);
     }
-    // ---- the prompt, teacher-forced through the windows
+    // ---- the prompt: [0, P) through the prompt path, the rest teacher-forced through the windows
     const int64_t n = (int64_t) a.tokens.size();
     std::vector<int32_t> win((size_t) T), nxt((size_t) T);
     const double load_s = std::chrono::duration<double>(Clock::now() - t_start).count();
-    std::fprintf(stderr, "strata generate: glm5-next: loaded in %.1f s; reading %lld tokens in windows of %d\n", load_s,
-                 (long long) n, T);
+    std::fprintf(stderr, "strata generate: glm5-next: loaded in %.1f s; reading %lld tokens (%lld by the prompt path) "
+                         "in windows of %d\n", load_s, (long long) n, (long long) P, T);
+    const char* state_dir = std::getenv("STRATA_GLM_STATE");
+    int64_t state_at = P > 0 ? P : -1;
+    if (const char* v = std::getenv("STRATA_GLM_STATE_AT"); v != nullptr && *v) state_at = std::atoll(v);
+    if (state_dir != nullptr && *state_dir && (state_at < 1 || state_at > n))
+        return fail("STRATA_GLM_STATE needs a position 1..n (STRATA_GLM_STATE_AT or --prefill)");
+    auto dump_state_at = [&](int64_t q) -> bool {
+        if (state_dir == nullptr || !*state_dir || q != state_at) return true;
+        if (!eng.dump_state(state_dir, q, err)) return false;
+        std::fprintf(stderr, "strata generate: glm5-next: session state after %lld positions written to %s\n",
+                     (long long) q, state_dir);
+        return true;
+    };
     // STRATA_GLM_MARK_EVERY / STRATA_GLM_MARKS: timing lines while the tokens are read (no effect on the numbers)
     std::vector<int64_t> marks;
     if (const char* v = std::getenv("STRATA_GLM_MARKS"); v != nullptr && *v) {
@@ -284,10 +335,42 @@ int glm_generate(const GlmRunArgs& a) {
         for (int64_t m = std::atoll(v); m < n; m += std::atoll(v)) marks.push_back(m);
     std::sort(marks.begin(), marks.end());
     size_t next_mark = 0;
-    const auto t0 = Clock::now();
     int64_t agree = 0, rows = 0;
-    for (int64_t q = 0; q < n;) {
-        const int Tq = (int) std::min<int64_t>(T, n - q);
+    int last_rows = 0;   // rows of the last logits written (the window's, or the prompt path's head)
+    double prefill_s = 0.0;
+    if (P > 0) {
+        const auto tp = Clock::now();
+        std::vector<int32_t> ids((size_t) P);
+        for (int64_t i = 0; i < P; ++i) ids[(size_t) i] = (int32_t) a.tokens[(size_t) i];
+        int n_logits = 1;
+        if (const char* v = std::getenv("STRATA_GLM_PREFILL_LOGPOS"); v != nullptr && *v)
+            n_logits = std::max(1, std::min(T, std::atoi(v)));
+        n_logits = (int) std::min<int64_t>(n_logits, P);
+        if (!prefill.run(ids.data(), P, 0, full ? n_logits : 0, err)) return fail(err);
+        last_rows = n_logits;
+        prefill_s = std::chrono::duration<double>(Clock::now() - tp).count();
+        if (full) {   // the prompt's last positions: the rows the windows would have written for them
+            const int64_t p0 = P - n_logits;
+            for (int t = 0; t < n_logits; ++t) nxt[(size_t) t] = p0 + t + 1 < n ? (int32_t) a.tokens[(size_t) (p0 + t + 1)] : -1;
+            if (logpos != nullptr && !eng.window_logprobs(nxt.data(), n_logits, p0, extra, logpos, err)) return fail(err);
+            for (int t = 0; logits_out && t < n_logits; ++t)
+                if (p0 + t >= logits_from && (!eng.copy_logits(t, lrow.data()) || !logits_out->append(lrow.data(), 1)))
+                    return fail("logits dump");
+            if (a.stats) {
+                int32_t am[8];
+                if (!eng.argmax(n_logits, am)) return fail("argmax");
+                for (int t = 0; t < n_logits; ++t)
+                    if (nxt[(size_t) t] >= 0) { agree += am[t] == nxt[(size_t) t]; ++rows; }
+            }
+        }
+        std::fprintf(stderr, "strata generate: glm5-next: prompt path: %lld tokens in %.2f s: %.1f tok/s\n",
+                     (long long) P, prefill_s, (double) P / prefill_s);
+        if (!dump_state_at(P)) return fail(err);
+    }
+    const auto t0 = Clock::now();
+    for (int64_t q = P; q < n;) {
+        int Tq = (int) std::min<int64_t>(T, n - q);
+        if (state_at > q) Tq = (int) std::min<int64_t>(Tq, state_at - q);   // a window ends at the state dump
         for (int t = 0; t < Tq; ++t) {
             win[(size_t) t] = (int32_t) a.tokens[(size_t) (q + t)];
             nxt[(size_t) t] = q + t + 1 < n ? (int32_t) a.tokens[(size_t) (q + t + 1)] : -1;
@@ -298,7 +381,8 @@ int glm_generate(const GlmRunArgs& a) {
         if (!eng.run(Tq, win.data(), q, err, x_file != nullptr ? x_in.data() : nullptr, from)) return fail(err);
         if (logpos != nullptr && !eng.window_logprobs(nxt.data(), Tq, q, extra, logpos, err)) return fail(err);
         for (int t = 0; logits_out && t < Tq; ++t)
-            if (!eng.copy_logits(t, lrow.data()) || !logits_out->append(lrow.data(), 1)) return fail("logits dump");
+            if (q + t >= logits_from && (!eng.copy_logits(t, lrow.data()) || !logits_out->append(lrow.data(), 1)))
+                return fail("logits dump");
         if (full && a.stats) {
             int32_t am[8];
             if (!eng.argmax(Tq, am)) return fail("argmax");
@@ -318,14 +402,46 @@ int glm_generate(const GlmRunArgs& a) {
                              (double) src.file_read_bytes() / 1e6, src.file_ms(), (long long) src.ram_reads());
             std::fprintf(stderr, "\n");
         }
+        last_rows = Tq;
+        if (P == 0 && !dump_state_at(q)) return fail(err);
     }
     const double s = std::chrono::duration<double>(Clock::now() - t0).count();
+    // --max-new K: greedy continuation, one token per window, from the last row read
+    if (a.max_new > 0) {
+        if (!full) return fail("--max-new needs the whole model");
+        std::vector<int32_t> gen;
+        int32_t next = 0;
+        {   // the last position read is the last row of the last window (or of the prompt path's head)
+            int32_t am[8];
+            if (!eng.argmax(last_rows, am)) return fail("argmax");
+            next = am[last_rows - 1];
+        }
+        for (int64_t i = 0; i < a.max_new; ++i) {
+            gen.push_back(next);
+            if (i + 1 == a.max_new) break;
+            const int64_t pos = n + i;
+            if (!eng.run(1, &next, pos, err)) return fail(err);
+            if (!eng.commit(1, err)) return fail(err);
+            int32_t am[1];
+            if (!eng.argmax(1, am)) return fail("argmax");
+            next = am[0];
+        }
+        std::string line = "GLM_GEN";
+        for (size_t i = 0; i < gen.size(); ++i) line += (i ? "," : " ") + std::to_string(gen[i]);
+        std::printf("%s\n", line.c_str());
+    }
     if (logpos != nullptr) std::fclose(logpos);
     for (auto& w : writers)
         if (w && !w->finish()) return fail("closing a dump file");
     if (logits_out && !logits_out->finish()) return fail("closing the logits dump");
-    std::fprintf(stderr, "strata generate: glm5-next: %lld tokens in %.2f s: %.2f tok/s (windows of %d%s)\n",
-                 (long long) n, s, (double) n / s, T, full ? "" : ", partial model");
+    std::fprintf(stderr, "strata generate: glm5-next: %lld tokens through the windows in %.2f s: %.2f tok/s (windows of "
+                         "%d%s)\n", (long long) (n - P), s, (double) (n - P) / std::max(s, 1e-9), T,
+                 full ? "" : ", partial model");
+    if (P > 0) {
+        std::fprintf(stderr, "strata generate: %s\n", prefill.stats_line().c_str());
+        if (const std::string r = prefill.timing_report(); !r.empty())
+            std::fprintf(stderr, "strata generate: %s\n", r.c_str());
+    }
     if (full && a.stats && rows > 0)
         std::fprintf(stderr, "strata generate: glm5-next: greedy pick = next prompt token at %lld of %lld positions\n",
                      (long long) agree, (long long) rows);
