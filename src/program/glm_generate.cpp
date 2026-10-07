@@ -50,6 +50,7 @@
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/conversation_disk.hpp"
+#include "strata/core/conversation_memory.hpp"
 #include "strata/core/glm.hpp"
 #include "strata/core/glm_conversation.hpp"
 #include "strata/core/glm_experts.hpp"
@@ -69,6 +70,7 @@
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string>
@@ -408,6 +410,16 @@ int glm_generate(const GlmRunArgs& a) {
     }
 
     // ---- the session
+    if (const uint64_t host = sc::glm_session_host_bytes(g, cfg); host > 0) {
+        // the streamed DSA caches' host copy is page-locked: refuse clearly rather than pin past what the RAM has
+        // (2 GiB kept back for everything else this process allocates later)
+        const std::optional<uint64_t> avail = sc::conversation_available_memory();
+        if (avail && host + (2ull << 30) > *avail)
+            return fail("not enough RAM for the DSA caches' host copy: --max-context " + std::to_string((long long) max_cells) +
+                        " with --kv-resident " + std::to_string((long long) cfg.kv_resident) + " pins " +
+                        std::to_string((long long) (host >> 20)) + " MiB, " + std::to_string((long long) (*avail >> 20)) +
+                        " MiB are available (2 GiB kept back): lower --max-context");
+    }
     sc::GlmEngine eng;
     if (!eng.init(wt, g, embed, full ? &head : nullptr, any_moe ? &experts : nullptr, cfg, err)) {
         cudaGetLastError();
