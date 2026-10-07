@@ -2019,6 +2019,25 @@ int main(int argc, char** argv) {
         glm.no_host_worker = o.no_host_worker;
         glm.pool_affinity = o.pool_affinity;
         glm.glm_pool = o.glm_pool;
+        // --serve (src/program/glm_serve.cpp): the same flags as the Qwen serve loop's
+        glm.serve = o.serve;
+        glm.window_given = o.spec > 0;
+        glm.kv = o.kv == "fp16" || o.kv == "int8" ? "int8" : o.kv;   // fp16 is Qwen's default: int8 is GLM's
+        glm.kv_resident = o.kv_resident;
+        glm.eos_ids = o.eos_ids;
+        glm.turn_token = o.turn_token;
+        glm.tail_role_token = o.tail_role_token;
+        glm.prompt_cache = o.prompt_cache;
+        glm.prompt_cache_every = o.prompt_cache_every;
+        glm.prompt_cache_root = o.prompt_cache_root;
+        glm.short_read = o.short_read;
+        glm.conversation_cache_mib = o.conversation_cache_mib;
+        glm.conversation_cache_slots = o.conversation_cache_slots;
+        glm.conversation_cache_min_free_mib = o.conversation_cache_min_free_mib;
+        glm.conversation_cache_disk = o.conversation_cache_disk;
+        glm.conversation_cache_disk_mib = o.conversation_cache_disk_mib;
+        glm.conversation_cache_disk_keep_superseded = o.conversation_cache_disk_keep_superseded;
+        glm.expert_profile_save = o.expert_profile_save;
         if (const int rc = glm5_next_preflight(o.native_preset, o.pack, &glm); rc >= 0) return rc;
     }
 #if defined(STRATA_USE_HIP)

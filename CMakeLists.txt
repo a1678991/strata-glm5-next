@@ -458,6 +458,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu strata_dsa_kernels
                         ${_strata_gpu_runtime_target})
+  target_sources(strata_engine PRIVATE src/core/glm_conversation.cpp)   # GLM conversation checkpoints
   if(STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/exchange_storage_test.cpp")
     add_executable(exchange_storage_test tests/core/exchange_storage_test.cpp)
     target_include_directories(exchange_storage_test PRIVATE include)
@@ -551,6 +552,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       add_test(NAME conversation_transfer_test COMMAND conversation_transfer_test)
       set_tests_properties(conversation_transfer_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1" TIMEOUT 120)
     endif()
+    # GLM (glm5-next) checkpoints and parked images through the RAM and disk tiers, on synthetic device state
+    add_executable(glm_conversation_test tests/glm/glm_conversation_test.cpp)
+    target_link_libraries(glm_conversation_test PRIVATE strata_engine)
+    add_test(NAME glm_conversation_test COMMAND glm_conversation_test)
+    set_tests_properties(glm_conversation_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
   endif()
 
   # `strata generate` (P2.S6).  The FIRST user-facing program: everything under it is a component, and this is
@@ -572,7 +578,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(tune_hipblaslt PRIVATE hip::host roc::hipblas roc::hipblaslt)
   endif()
 
-  add_executable(strata src/program/generate.cpp src/program/glm_generate.cpp)
+  add_executable(strata src/program/generate.cpp src/program/glm_generate.cpp src/program/glm_serve.cpp)
   target_include_directories(strata PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
 
