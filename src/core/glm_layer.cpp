@@ -83,7 +83,8 @@ Layout carve(const ModelGeometry& g, const GlmConfig& cfg, void* base) {
     L.dsa_cache.assign((size_t) g.n_layers, nullptr);
     for (int64_t l = 0; l < g.n_layers; ++l) {
         if (g.attn_layer(l)) {
-            L.dsa_cache[(size_t) l] = c.take<uint8_t>(sk::dsa_kv_bytes(ds, cfg.kv_fmt, cfg.max_cells, 0));
+            L.dsa_cache[(size_t) l] = c.take<uint8_t>(sk::dsa_kv_bytes(ds, cfg.kv_fmt, cfg.max_cells,
+                                                                       glm_kv_slots(g, cfg)));
             L.kda[(size_t) l] = {};
             continue;
         }
@@ -279,6 +280,27 @@ uint64_t glm_session_bytes(const ModelGeometry& g, const GlmConfig& cfg) {
     return g.glm() ? carve(g, cfg, nullptr).bytes : 0;
 }
 
+int64_t glm_kv_slots(const ModelGeometry& g, const GlmConfig& cfg) {
+    if (!g.glm() || cfg.kv_resident <= 0 || g.idx_kpool <= 0) return 0;
+    const int64_t pages = (cfg.max_cells + g.idx_kpool - 1) / g.idx_kpool;
+    const int64_t slots = (cfg.kv_resident + g.idx_kpool - 1) / g.idx_kpool;
+    return slots >= pages ? 0 : slots;
+}
+
+int64_t glm_kv_resident_min(const ModelGeometry& g, int max_t) {
+    if (!g.glm() || g.idx_kpool <= 0) return 0;
+    const sk::DsaShapes s = dsa_shapes(g);
+    // kv_stream_resolve: n_q x (cap / page_size + 2) distinct pages per call, plus one, and at least its resolve
+    // block's 1,024 slots (kv_stream.cu: the clock sweep must not take a slot twice)
+    return std::max<int64_t>((int64_t) max_t * (sk::dsa_sel_cap(s) / s.kpool + 2) + 1, 1024) * s.kpool;
+}
+
+uint64_t glm_session_host_bytes(const ModelGeometry& g, const GlmConfig& cfg) {
+    if (glm_kv_slots(g, cfg) == 0) return 0;
+    const sk::DsaShapes ds = dsa_shapes(g);
+    return (uint64_t) g.n_qsa_layers() * sk::dsa_kv_host_bytes(ds, cfg.kv_fmt, cfg.max_cells);
+}
+
 GlmEngine::~GlmEngine() {
     if (stream_) cudaStreamSynchronize((cudaStream_t) stream_);
     for (void* e : ev_) if (e) cudaEventDestroy((cudaEvent_t) e);
@@ -286,6 +308,8 @@ GlmEngine::~GlmEngine() {
     if (h_tok_) cudaFreeHost(h_tok_);
     if (h_steps_) cudaFreeHost(h_steps_);
     if (h_nkeep_) cudaFreeHost(h_nkeep_);
+    if (host_kv_) cudaFreeHost(host_kv_);
+    if (d_sample_) cudaFree(d_sample_);
     if (arena_) cudaFree(arena_);
     if (stream_) cudaStreamDestroy((cudaStream_t) stream_);
 }
@@ -295,6 +319,18 @@ bool GlmEngine::init(const WeightTable& wt, const ModelGeometry& g, const Native
     if (!g.glm()) { err = "glm: not a glm5-next geometry"; return false; }
     if (cfg.max_t < 1 || cfg.max_t > sk::DSA_MAX_T) { err = "glm: the window must be 1..8 tokens"; return false; }
     if (cfg.max_cells < 1 || cfg.max_cells > INT32_MAX / 2) { err = "glm: context out of range"; return false; }
+    if (glm_kv_slots(g, cfg) > 0) {
+        if (cfg.kv_fmt != sk::kDsaLatInt8 || 4 * g.idx_key_dim != g.kv_lora) {
+            err = "glm: --kv-resident streams the int8 latent only (4 * idx_dim == kv_lora)";
+            return false;
+        }
+        if (cfg.kv_resident < glm_kv_resident_min(g, cfg.max_t)) {
+            err = "glm: --kv-resident " + std::to_string(cfg.kv_resident) + " is below the " +
+                  std::to_string(glm_kv_resident_min(g, cfg.max_t)) + " cells a streamed cache needs (a window of " +
+                  std::to_string(cfg.max_t) + " token(s): its selections resident at once, and at least 1,024 pages)";
+            return false;
+        }
+    }
     if (g.ssm_state_size != 128 || g.hc != 4 || !g.ssm_conv_separate || g.ssm_d_conv != 4) {
         err = "glm: the KDA/mHC kernels need head_dim 128, 4 streams, separate convs of 4 taps";
         return false;
@@ -332,9 +368,27 @@ bool GlmEngine::init(const WeightTable& wt, const ModelGeometry& g, const Native
     const Layout L = carve(g, cfg, (void*) (((uintptr_t) arena_ + kAlign - 1) / kAlign * kAlign));
     kda_.assign((size_t) g.n_layers, KdaLayer{});
     dsa_.assign((size_t) g.n_layers, sk::DsaKvCache{});
+    const int64_t kv_slots = glm_kv_slots(g, cfg);
+    if (kv_slots > 0) {   // the streamed caches' authoritative copies: page-locked, device-mapped host memory
+        const uint64_t per = sk::dsa_kv_host_bytes(dshape_, cfg.kv_fmt, cfg.max_cells);
+        host_kv_bytes_ = per * (uint64_t) g.n_qsa_layers();
+        if (!cuda_ok(cudaHostAlloc(&host_kv_, host_kv_bytes_, cudaHostAllocMapped), "the DSA caches' host copy", err))
+            return false;
+        std::memset(host_kv_, 0, host_kv_bytes_);
+    }
+    int64_t host_i = 0;
     for (int64_t l = 0; l < g.n_layers; ++l) {
         if (g.attn_layer(l)) {
-            sk::dsa_kv_carve(L.dsa_cache[(size_t) l], dshape_, cfg.kv_fmt, cfg.max_cells, 0, dsa_[(size_t) l]);
+            sk::dsa_kv_carve(L.dsa_cache[(size_t) l], dshape_, cfg.kv_fmt, cfg.max_cells, kv_slots, dsa_[(size_t) l]);
+            if (kv_slots > 0) {
+                void* dev = nullptr;
+                const uint64_t per = sk::dsa_kv_host_bytes(dshape_, cfg.kv_fmt, cfg.max_cells);
+                if (!cuda_ok(cudaHostGetDevicePointer(&dev, (uint8_t*) host_kv_ + per * (uint64_t) host_i++, 0),
+                             "the DSA host copy's device pointer", err))
+                    return false;
+                sk::dsa_kv_host_carve((void*) (((uintptr_t) dev + 255) / 256 * 256), dshape_, cfg.kv_fmt,
+                                      cfg.max_cells, dsa_[(size_t) l]);
+            }
         } else {
             const auto& k = L.kda[(size_t) l];
             kda_[(size_t) l] = KdaLayer{k.hist, k.state, k.qkv, k.h, k.fb, k.braw};
@@ -704,6 +758,24 @@ bool GlmEngine::argmax(int T, int32_t* out) const {
         out[t] = (int32_t) (std::max_element(row.begin(), row.end()) - row.begin());
     }
     return true;
+}
+
+bool GlmEngine::sample(int T, const sk::SamplerParams& p, const int32_t* history, int h, int32_t* out,
+                       std::string& err) {
+    if (!head_runs() || T < 1 || T > cfg_.max_t) { err = "glm: sample: no head rows"; return false; }
+    if (h < 0 || h > kSampleHistoryCap || (h > 0 && history == nullptr)) { err = "glm: sample: history"; return false; }
+    cudaStream_t st = (cudaStream_t) stream_;
+    if (d_sample_ == nullptr &&
+        !cuda_ok(cudaMalloc((void**) &d_sample_, (size_t) cfg_.max_t * (1 + kSampleHistoryCap) * 4), "sampler buffers",
+                 err))
+        return false;
+    int32_t* d_hist = d_sample_ + cfg_.max_t;
+    if (h > 0) cudaMemcpyAsync(d_hist, history, (size_t) T * h * 4, cudaMemcpyHostToDevice, st);
+    sk::SamplerParams sp = p;
+    sp.counter = (uint64_t) last_pos0_;   // Philox(seed, position): the verifier's rule (verify.cpp)
+    sk::sample_tokens(logits_, T, (int) g_.n_vocab, h > 0 ? d_hist : nullptr, h, sp, d_sample_, st);
+    cudaMemcpyAsync(out, d_sample_, (size_t) T * 4, cudaMemcpyDeviceToHost, st);
+    return cuda_ok(cudaStreamSynchronize(st), "sample", err);
 }
 
 bool GlmEngine::window_logprobs(const int32_t* targets, int T, int64_t pos0, int32_t extra_id, std::FILE* out,
