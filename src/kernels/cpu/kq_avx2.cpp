@@ -12,6 +12,7 @@
 //
 // The gain is the weight-side work and the weight bytes, read once per verify window instead of once per token.
 #include "strata/kernels/cpu/kq_avx2.hpp"
+#include "strata/kernels/cpu/native_expert_clamp.hpp"
 
 #define GGML_COMMON_DECL_CPP
 #define GGML_COMMON_IMPL_CPP
@@ -238,12 +239,21 @@ void bf16_rows_dot(const uint16_t* w, int rows, int cols, const float* x, float*
 
 void kq256_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, int nt,
                    float* const* ff, int r0, int r1) {
+    kq256_gu_rows_clamp(type, blob, gu_row, up_off, n, act, nt, ff, r0, r1, 0.0f);
+}
+
+void kq256_gu_rows_clamp(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, int nt,
+                   float* const* ff, int r0, int r1, float limit) {
     for (int t0 = 0; t0 < nt; t0 += MAXT) {
         const int m = nt - t0 < MAXT ? nt - t0 : MAXT;
         float g[MAXT], u[MAXT];
         for (int r = r0; r < r1; ++r) {
             dot_rows(type, blob + (size_t) r * gu_row, n, act + t0, m, g);
             dot_rows(type, blob + up_off + (size_t) r * gu_row, n, act + t0, m, u);
+            if (limit > 0.0f) {   // GLM-5.3-Flash's clamped SwiGLU (native_expert_clamp.hpp)
+                for (int t = 0; t < m; ++t) ff[t0 + t][r] = swiglu_clamped(g[t], u[t], limit);
+                continue;
+            }
             // native_gu_rows' own SwiGLU expression: the same bits as the per-token ggml path
             for (int t = 0; t < m; ++t) ff[t0 + t][r] = (g[t] / (1.f + std::exp(-g[t]))) * u[t];
         }

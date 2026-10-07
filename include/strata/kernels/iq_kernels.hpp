@@ -16,6 +16,9 @@ namespace strata::kernels {
 bool iq_supported(int ggml_type) noexcept;
 /// The token-embedding types iq_embed_rows and iq_dequant_f32 read: the i-quants above and BF16 (30).
 bool embed_type_supported(int ggml_type) noexcept;
+/// embed_type_supported plus Q6_K (14): GLM-5.3-Flash UD-IQ3_XXS stores token_embd as Q6_K.  NativeEmbed::load asks
+/// this one for a glm5-next file only, so a qwen4exp file is accepted or refused exactly as before.
+bool glm_embed_type_supported(int ggml_type) noexcept;
 /// Bytes of one row of `n` values of `ggml_type` (n a multiple of the type's block).
 size_t iq_row_bytes(int ggml_type, int64_t n) noexcept;
 
@@ -44,10 +47,15 @@ struct NativeExpertLayout {
     size_t gu_row = 0, d_row = 0;       // bytes per row
     size_t up_off = 0, down_off = 0;    // byte offsets inside the blob
     size_t bytes = 0;                   // the whole blob
+    /// GLM-5.3-Flash (swiglu_clamp_exp, 10.0): > 0 makes the SwiGLU silu(min(gate, limit)) * clamp(up, -limit, limit),
+    /// ggml's swiglu_clamp.  0 (native_expert_layout's value, every Qwen layer) leaves the epilogue as it was.
+    float swiglu_limit = 0.0f;
 };
 NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff);
 /// Whether `native_expert_grouped` has kernels for this gate/up and down type pair at these dimensions, and the
 /// prompt path's dequantizer takes both (checked for every layer at startup, before anything is allocated).
+/// Down rows may also be Q6_K (14; GLM-5.3-Flash UD-IQ4_XS layers 11, 12, 44), dequantized by iq_dequant_f16/_f32 too,
+/// and IQ3_S (21; GLM-5.3-Flash UD-IQ3_XXS, 39 layers), the gate/up role's IQ3_S kernels.
 bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) noexcept;
 
 /// Bytes of scratch `native_expert_grouped` needs for `cap_entries` entries.
