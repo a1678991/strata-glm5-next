@@ -3,6 +3,7 @@
 
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_source.hpp"
+#include "strata/core/glm_seldump.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
@@ -471,6 +472,13 @@ struct GlmPrefill::Impl {
                 sk::dsa_select(b.scores, s, steps, S, d.max_pools, d.cap, b.ids, st);
                 ids = b.ids;
             }
+            // STRATA_GLM_SEL_DUMP: the selection (and pool scores where the indexer ran) of the listed positions
+            if (const sc::GlmSelDump& sd = sc::GlmSelDump::get(); sd.any_in(pos_first, S))
+                for (int64_t i = 0; i < S; ++i)
+                    if (sd.has(pos_first + i) &&
+                        !sd.write(l, pos_first + i, ids ? b.ids + i * d.cap : nullptr,
+                                  ids && i >= sparse0 ? b.scores + i * d.max_pools : nullptr, s, st, "prefill", err))
+                        return false;
             tm.mark(kDsaAttn, st);
             glm::dsa_prompt_attend(c, s, b.q_abs, ids, d.cap, steps, S, scale, b.olat, st);
             tm.mark(kDsaOut, st);

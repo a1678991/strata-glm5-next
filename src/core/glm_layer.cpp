@@ -3,6 +3,7 @@
 #include "strata/core/glm.hpp"
 
 #include "strata/core/glm_experts.hpp"
+#include "strata/core/glm_seldump.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/f16_bits.hpp"
@@ -479,8 +480,19 @@ bool GlmEngine::layer(int64_t l, int T, std::string& err) {
     mhc_half(w, false, T);
     if (dbg && !(dump_node(0, mixes_, MIX, T, err) && dump_node(1, cur_, E, T, err) && dump_node(2, xn_, E, T, err)))
         return false;
-    if (w.kind == LayerKind::DsaMoe) sk::dsa_decode(w.dsa, dshape_, dsa_[(size_t) l], xn_, steps_, T, dsc_, f_, st);
-    else kda(l, w, T);
+    if (w.kind == LayerKind::DsaMoe) {
+        sk::dsa_decode(w.dsa, dshape_, dsa_[(size_t) l], xn_, steps_, T, dsc_, f_, st);
+        // STRATA_GLM_SEL_DUMP: the selection and pool scores of the listed positions (glm_seldump.hpp)
+        if (const GlmSelDump& sd = GlmSelDump::get(); sd.on)
+            for (int t = 0; t < T; ++t) {
+                const int64_t pos = h_steps_[(size_t) t * sk::kStepCount + sk::kStepPos];
+                if (sd.has(pos) && !sd.write(l, pos, dsc_.ids + (size_t) t * dsc_.cap,
+                                             dsc_.scores + (size_t) t * dsc_.max_pools, dshape_, st, "decode", err))
+                    return false;
+            }
+    } else {
+        kda(l, w, T);
+    }
     if (dbg && !dump_node(3, f_, E, T, err)) return false;
     sk::mhc_post(f_, x_, post_, comb_, x_, mshape_, T, st);
     if (dbg && !dump_node(4, x_, g_.hc * E, T, err)) return false;

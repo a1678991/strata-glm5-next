@@ -429,6 +429,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu strata_dsa_kernels
                         ${_strata_gpu_runtime_target})
+  target_sources(strata_engine PRIVATE src/core/glm_seldump.cpp)   # STRATA_GLM_SEL_DUMP (glm_seldump.hpp)
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/file_expert_source_test.cpp")
     enable_testing()
     add_executable(file_expert_source_test tests/core/file_expert_source_test.cpp)
