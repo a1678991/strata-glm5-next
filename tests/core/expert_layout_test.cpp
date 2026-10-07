@@ -269,6 +269,52 @@ void arena() {
                 }
             check(pre && fs.file_blob_bytes() > 0 && fs.file_ms() >= 0.0,
                   "prefetch on 2 threads, then blob(): the same bytes");
+            // the GLM decode's reader - whole blobs in parts on a pool of threads, urgent before speculative,
+            // promoted, cancelled - gives the bytes copy_blob gives, for every read mode and part size (O_DIRECT falls
+            // back to pread where the temporary directory cannot do it, e.g. tmpfs; TMPDIR on a disk exercises it)
+            using FES = strata::core::FileExpertSource;
+            for (FES::ReadIo io : {FES::ReadIo::Direct, FES::ReadIo::Pread, FES::ReadIo::Mmap})
+                for (uint64_t part : {(uint64_t) 64 << 10, (uint64_t) 1 << 20, (uint64_t) 64 << 20}) {
+                    FES::ReaderOptions o;
+                    o.threads = 3;
+                    o.part_bytes = part;
+                    o.io = io;
+                    std::string e4;
+                    const bool started = fs.start_reader(o, e4);
+                    std::vector<std::vector<uint8_t>> out(8, std::vector<uint8_t>(buf.size(), 0xCD));
+                    FES::ReadTicket t[8];
+                    for (int i = 0; i < 8; ++i)   // every blob twice: urgent, then speculative
+                        fs.read_async(t[i], (i / 2) % 2, i % 2, out[(size_t) i].data(), i < 4);
+                    fs.read_promote(t[5]);
+                    const bool dropped = fs.read_cancel(t[7]);
+                    bool good = started;
+                    for (int i = 0; i < 8; ++i) {
+                        if (i == 7 && dropped) continue;
+                        const int64_t l = (i / 2) % 2, e = i % 2;
+                        good = good && fs.read_wait(t[i]) &&
+                               std::memcmp(out[(size_t) i].data(), dst.data() + L.blob_offset(l, e),
+                                           (size_t) L.blob_bytes(l)) == 0;
+                    }
+                    const auto rs = fs.reader_stats();
+                    good = good && rs.blobs + rs.cancelled == 8 && rs.cancelled == (dropped ? 1 : 0);
+                    check(good, std::string("the reader (") +
+                                    (io == FES::ReadIo::Direct ? "direct" : io == FES::ReadIo::Pread ? "pread" : "mmap") +
+                                    ", parts of " + std::to_string(part) + " B): the bytes copy_blob gives" +
+                                    (started ? "" : ": " + e4));
+                    fs.stop_reader();
+                }
+            {   // a ticket queued when the reader stops finishes as failed; nobody blocks
+                FES::ReaderOptions o;
+                o.threads = 1;
+                std::string e5;
+                const bool started = fs.start_reader(o, e5);
+                FES::ReadTicket a[6];
+                for (int i = 0; i < 6; ++i) fs.read_async(a[i], 1, i % 2, buf.data(), false);
+                fs.stop_reader();
+                bool all_done = started;
+                for (int i = 0; i < 6; ++i) all_done = all_done && fs.read_done(a[i]);
+                check(all_done, "stop_reader finishes every queued ticket");
+            }
         }
         fs.close();
         // with experts.bin present, the pack's file is mapped as before, whatever set_gguf says

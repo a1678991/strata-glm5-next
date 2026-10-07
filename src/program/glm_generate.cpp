@@ -176,7 +176,10 @@ int glm_generate(const GlmRunArgs& a) {
             probe.max_t = T;
             probe.max_cells = max_cells;
             const double session = (double) sc::glm_session_bytes(g, probe) / 1048576.0;
-            const double staging = (double) T * g.n_expert_used * (double) lay.max_blob / 1048576.0;
+            // the staging slots, and the lookahead's VRAM slots when STRATA_GLM_PRESTAGE asks for them
+            const char* pre = std::getenv("STRATA_GLM_PRESTAGE");
+            const int64_t n_pre = pre != nullptr ? std::max<int64_t>(0, std::min<int64_t>(64, std::atoll(pre))) : 0;
+            const double staging = (double) (T * g.n_expert_used + n_pre) * (double) lay.max_blob / 1048576.0;
             probe.n_run = n_run;
             const double prompt = P > 0 ? (double) strata::prefill::GlmPrefill::bytes_needed(
                                               g, probe, std::min<int64_t>(pf_chunk, P)) / 1048576.0 : 0.0;
@@ -476,6 +479,7 @@ int glm_generate(const GlmRunArgs& a) {
                      (long long) agree, (long long) rows);
     if (any_moe) {
         std::fprintf(stderr, "strata generate: %s\n", experts.stats_line().c_str());
+        std::fprintf(stderr, "strata generate: %s\n", experts.fetch_line().c_str());
         std::fprintf(stderr, "strata generate: glm5-next: file tier: %lld reads, %.1f MB, %.1f ms; RAM tier reads %lld\n",
                      (long long) src.file_reads(), (double) src.file_read_bytes() / 1e6, src.file_ms(),
                      (long long) src.ram_reads());
