@@ -357,6 +357,116 @@ bool GlmExperts::stage_miss(int64_t l, int32_t e, bool from_file, uint8_t* dst, 
     return true;
 }
 
+bool GlmExperts::calibrate_pool(int n, PoolCalibration& r, std::string& err) {
+    r = PoolCalibration{};
+    if (gp_ == nullptr || !gp_->ready() || cpu_dev_ == nullptr) {
+        err = "glm experts: the pool calibration needs the pool attached before init";
+        return false;
+    }
+    auto ram_tier = [&](int64_t l, int32_t e) {
+        return (cache_ == nullptr || cache_->slot_of(l, e) == kNotResident) && src_->has_resident(l, e);
+    };
+    std::vector<std::pair<int, int64_t>> layers;   // (RAM-tier experts, layer), the most first
+    for (int64_t l = 0; l < g_.n_layers; ++l) {
+        if (lay_[(size_t) l].bytes == 0) continue;
+        int c = 0;
+        for (int32_t e = 0; e < g_.n_expert; ++e) c += ram_tier(l, e);
+        if (c > 0) layers.emplace_back(c, l);
+    }
+    std::stable_sort(layers.begin(), layers.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::vector<std::pair<int64_t, int32_t>> list;
+    for (const auto& [c, l] : layers)
+        for (int32_t e = 0; e < g_.n_expert && (int) list.size() < n; ++e)
+            if (ram_tier(l, e)) list.emplace_back(l, e);
+    if (list.empty()) { err = "glm experts: no RAM-tier expert to calibrate the pool on"; return false; }
+    r.layer = list[0].first;
+    const int T = max_t_, per = T * k_;
+    const int64_t E = g_.n_embd, cap = (int64_t) max_t_ * k_;
+    std::vector<std::pair<size_t, int>> calls;   // (first, count): one layer, at most T * k experts
+    for (size_t i = 0; i < list.size();) {
+        size_t j = i;
+        while (j < list.size() && j - i < (size_t) per && list[j].first == list[i].first) ++j;
+        calls.emplace_back(i, (int) (j - i));
+        i = j;
+    }
+    // the activation: fixed pseudo-random rows (the timing does not depend on the values)
+    std::vector<float> hx((size_t) T * E);
+    uint32_t s = 12345u;
+    for (float& v : hx) { s = s * 1664525u + 1013904223u; v = (float) ((int32_t) (s >> 8) - (1 << 23)) / (float) (1 << 23); }
+    cudaStream_t st = nullptr;
+    if (cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking) != cudaSuccess) {
+        err = "glm experts: the calibration's stream";
+        return false;
+    }
+    cudaMemcpyAsync(shared_, hx.data(), hx.size() * 4, cudaMemcpyHostToDevice, st);
+    sk::quantize_q8_1_rows(shared_, T, E, xq_, st);
+    cudaStream_t cs = (cudaStream_t) copy_;
+    bool ok = cudaStreamSynchronize(st) == cudaSuccess;
+    auto pool_call = [&](size_t first, int cnt) {
+        const int64_t l = list[first].first;
+        gp_->begin(l, T);
+        std::memcpy(gp_->host_x(), hx.data(), hx.size() * 4);
+        for (int i = 0; i < cnt; ++i) {
+            const uint8_t* hb = src_->blob(l, list[first + (size_t) i].second);
+            if (hb == nullptr) return false;
+            gp_->add(hb, &i, 1);
+        }
+        gp_->run();
+        cudaMemcpyAsync(cpu_dev_, gp_->upload_src(), gp_->upload_bytes(), cudaMemcpyHostToDevice, st);
+        return cudaStreamSynchronize(st) == cudaSuccess;
+    };
+    auto gpu_call = [&](size_t first, int cnt) {
+        const int64_t l = list[first].first;
+        const uint64_t blob = lay_[(size_t) l].bytes;
+        uint8_t* hp = (uint8_t*) h_plan_;
+        auto* grp_ptr = (unsigned long long*) hp;
+        auto* grp_start = (int32_t*) (hp + (size_t) cap * 8);
+        auto* n_groups = grp_start + cap + 1;
+        auto* ent_dst = n_groups + 1;
+        auto* ent_tok = ent_dst + cap;
+        for (int i = 0; i < cnt; ++i) {
+            uint8_t* dst = staging_ + (uint64_t) i * slot_bytes_;
+            const uint8_t* hb = src_->blob(l, list[first + (size_t) i].second);
+            if (hb == nullptr || cudaMemcpyAsync(dst, hb, blob, cudaMemcpyHostToDevice, cs) != cudaSuccess) return false;
+            grp_ptr[i] = (unsigned long long) (uintptr_t) dst;
+            grp_start[i] = i;
+            ent_dst[i] = i;
+            ent_tok[i] = i / k_;
+        }
+        grp_start[cnt] = cnt;
+        *n_groups = cnt;
+        cudaEventRecord((cudaEvent_t) ev_ram_, cs);
+        cudaStreamWaitEvent(st, (cudaEvent_t) ev_ram_, 0);
+        uint8_t* dp = (uint8_t*) plan_;
+        cudaMemcpyAsync(dp, hp, plan_bytes_, cudaMemcpyHostToDevice, st);
+        const auto* d_start = (const int32_t*) (dp + (size_t) cap * 8);
+        const int32_t* d_n = d_start + cap + 1;
+        sk::native_expert_grouped(lay_[(size_t) l], (const unsigned long long*) dp, d_start, d_n, d_n + 1,
+                                  d_n + 1 + cap, cap, cap, xq_, scratch_, parts_, st);
+        return cudaStreamSynchronize(st) == cudaSuccess;
+    };
+    using Clk = std::chrono::steady_clock;
+    auto timed = [&](auto&& call, double& ms) {
+        if (!call(calls[0].first, calls[0].second)) return false;   // untimed: first touch, kernel loads
+        const auto t0 = Clk::now();
+        for (const auto& [first, cnt] : calls)
+            if (!call(first, cnt)) return false;
+        ms = std::chrono::duration<double, std::milli>(Clk::now() - t0).count();
+        return true;
+    };
+    ok = ok && timed(pool_call, r.ms_pool) && timed(gpu_call, r.ms_gpu);
+    cudaStreamDestroy(st);
+    gp_->reset_stats();
+    if (!ok) {
+        err = std::string("glm experts: the pool calibration: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    r.experts = (int) list.size();
+    r.calls = (int) calls.size();
+    for (const auto& [l, e] : list) r.bytes += lay_[(size_t) l].bytes;
+    return true;
+}
+
 std::string GlmExperts::stats_line() const {
     char b[512];
     std::snprintf(b, sizeof b,

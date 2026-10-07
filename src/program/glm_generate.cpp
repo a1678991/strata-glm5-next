@@ -40,7 +40,9 @@
 //
 // The RAM tier's experts are computed by the CPU expert pool (include/strata/core/glm_pool.hpp; --pool-workers,
 // --pool-affinity, --no-host-worker as on the Qwen path; the host thread is pinned to the first physical core while the
-// windows run); STRATA_GLM_POOL=0 copies them into VRAM staging and computes them on the GPU instead (the A/B arm).
+// windows run) or copied into VRAM staging and computed on the GPU: --glm-pool on|off|auto (default auto: a calibration
+// at start times both on the same RAM-tier experts and keeps the faster, GlmExperts::calibrate_pool;
+// STRATA_GLM_POOL_CALIBRATE=N experts, default 256).  STRATA_GLM_POOL=0|1 overrides --glm-pool (the A/B arms).
 #include "strata/program/glm_generate.hpp"
 
 #include "strata/artifact/gguf_reader.hpp"
@@ -85,6 +87,43 @@ double free_mib() {
     return (double) f / 1048576.0;
 }
 
+// --prefill auto: the chunk sizes it tries, largest first.  Measured on the RTX 3090 (UD-IQ3_XXS, 16,376-token
+// prompt, window 2): 8,192 read at 281.9 tok/s with 2,862 MiB of buffers, 4,096 at 155.4 with 1,606.
+constexpr int64_t kAutoChunks[] = {8192, 4096, 2048};
+
+// With --expert-cache auto the prompt buffers come out of the expert cache's VRAM: the largest chunk whose buffers
+// take at most this share of what the two share (default 25%; STRATA_GLM_PREFILL_SHARE=<percent>).  On the 3090
+// 8,192's buffers are 18.6% of it and cost the cache ~147 of ~1,600 experts (~2% of the lookups move to RAM).
+double auto_share() {
+    const char* v = std::getenv("STRATA_GLM_PREFILL_SHARE");
+    return v != nullptr && *v ? std::max(0.0, std::min(100.0, std::atof(v))) / 100.0 : 0.25;
+}
+
+// The largest of kAutoChunks (each capped at the prompt) whose buffers fit `limit` MiB, else the smallest; logged.
+int64_t auto_chunk(const sc::ModelGeometry& g, const sc::GlmConfig& cfg, int64_t P, double limit, double room,
+                   const std::string& what) {
+    std::string tried;
+    int64_t pick = 0;
+    double pick_mib = 0;
+    for (const int64_t c : kAutoChunks) {
+        const double mib = (double) strata::prefill::GlmPrefill::bytes_needed(g, cfg, std::min(c, P)) / 1048576.0;
+        char b[64];
+        std::snprintf(b, sizeof b, "%s%lld: %.0f MiB", tried.empty() ? "" : ", ", (long long) c, mib);
+        tried += b;
+        if (pick == 0 && mib <= limit) { pick = c; pick_mib = mib; }
+    }
+    const bool fits = pick != 0;
+    if (!fits) {
+        pick = kAutoChunks[sizeof kAutoChunks / sizeof kAutoChunks[0] - 1];
+        pick_mib = (double) strata::prefill::GlmPrefill::bytes_needed(g, cfg, std::min(pick, P)) / 1048576.0;
+    }
+    std::fprintf(stderr, "strata generate: glm5-next: --prefill auto: chunks of %lld tokens (%.0f MiB of buffers, %.1f%% "
+                         "%s%s; %s)\n",
+                 (long long) std::min(pick, P), pick_mib, room > 0 ? 100.0 * pick_mib / room : 0.0, what.c_str(),
+                 fits ? "" : "; none fits, the smallest taken", tried.c_str());
+    return pick;
+}
+
 }  // namespace
 
 int glm_generate(const GlmRunArgs& a) {
@@ -108,9 +147,12 @@ int glm_generate(const GlmRunArgs& a) {
     const bool full = n_run == g.n_layers;
     const int T = std::max(1, std::min(8, a.window));
     const int64_t max_cells = std::max<int64_t>(a.max_context, (int64_t) a.tokens.size() + std::max<int64_t>(0, a.max_new));
-    // the prompt path: positions [0, P) in chunks (--prefill N, or auto: 4,096 tokens, see glm_prefill.hpp)
+    // the prompt path: positions [0, P) in chunks (--prefill N, or auto: the largest of kAutoChunks that fits, chosen
+    // below where the VRAM is budgeted: with --expert-cache auto before the cache is sized, else from the VRAM left
+    // once the session is in)
     const int64_t n_tok = (int64_t) a.tokens.size();
-    const int64_t pf_chunk = a.prefill_auto ? 4096 : a.prefill_chunk;
+    int64_t pf_chunk = a.prefill_auto ? kAutoChunks[0] : a.prefill_chunk;
+    bool pf_chosen = !a.prefill_auto;
     int64_t P = 0;
     if (pf_chunk > 0) {
         P = a.prefill_until > 0 ? std::min<int64_t>(a.prefill_until, n_tok) : std::max<int64_t>(1, n_tok - 1);
@@ -154,7 +196,7 @@ int glm_generate(const GlmRunArgs& a) {
     sc::ExpertCache cache;
     sc::GlmExperts experts;
     std::unique_ptr<strata::kernels::cpu::ExpertPool> cpu_pool;
-    sc::GlmPool glm_pool;
+    std::unique_ptr<sc::GlmPool> glm_pool = std::make_unique<sc::GlmPool>();   // reset when --glm-pool auto picks staging
     std::vector<std::pair<int32_t, int32_t>> ranked;
     if (any_moe) {
         src.set_gguf(a.native);
@@ -181,9 +223,20 @@ int glm_generate(const GlmRunArgs& a) {
             const int64_t n_pre = pre != nullptr ? std::max<int64_t>(0, std::min<int64_t>(64, std::atoll(pre))) : 0;
             const double staging = (double) (T * g.n_expert_used + n_pre) * (double) lay.max_blob / 1048576.0;
             probe.n_run = n_run;
+            double room = free_mib() - session - staging - 512.0 - (double) a.vram_reserve_mib;
+            if (P > 0 && !pf_chosen) {   // --prefill auto: the chunk first, then the cache gets the rest
+                // (the share, or whatever the cache cannot use once every expert is in it)
+                double all = 0;
+                for (const auto& [l, e] : ranked) all += (double) lay.blob_bytes(l) / 1048576.0;
+                pf_chunk = auto_chunk(g, probe, P, std::max(auto_share() * room, room - all), room, "of the " +
+                                      std::to_string((long long) room) + " MiB the expert cache and the prompt "
+                                      "buffers share; at most " + std::to_string((int) (100 * auto_share())) +
+                                      "% or what every expert (" + std::to_string((long long) all) + " MiB) leaves");
+                pf_chosen = true;
+            }
             const double prompt = P > 0 ? (double) strata::prefill::GlmPrefill::bytes_needed(
                                               g, probe, std::min<int64_t>(pf_chunk, P)) / 1048576.0 : 0.0;
-            double room = free_mib() - session - staging - prompt - 512.0 - (double) a.vram_reserve_mib;
+            room -= prompt;
             want = 0;
             for (const auto& [l, e] : ranked) {
                 const double b = (double) lay.blob_bytes(l) / 1048576.0;
@@ -219,17 +272,44 @@ int glm_generate(const GlmRunArgs& a) {
                          (double) src.resident_bytes() / 1073741824.0,
                          src.complement_pinned() ? "page-locked" : "pageable");
         }
-        const char* pv = std::getenv("STRATA_GLM_POOL");
-        if (src.resident_bytes() > 0 && !(pv != nullptr && std::atoi(pv) == 0)) {
+        // --glm-pool on|off|auto (1 / 0 / -1); STRATA_GLM_POOL=0|1 overrides it
+        int pool_mode = a.glm_pool;
+        if (const char* pv = std::getenv("STRATA_GLM_POOL"); pv != nullptr && *pv) pool_mode = std::atoi(pv) != 0 ? 1 : 0;
+        if (src.resident_bytes() > 0 && pool_mode != 0) {
             cpu_pool = std::make_unique<strata::kernels::cpu::ExpertPool>(a.pool_workers, /*pin=*/true,
                                                                           /*host_works=*/!a.no_host_worker,
                                                                           a.pool_affinity);
-            if (!glm_pool.init(g, cpu_pool.get(), T, (int) g.n_expert_used, err)) return fail(err);
-            experts.set_pool(&glm_pool);
+            if (!glm_pool->init(g, cpu_pool.get(), T, (int) g.n_expert_used, err)) return fail(err);
+            experts.set_pool(glm_pool.get());
             std::fprintf(stderr, "strata generate: glm5-next: RAM-tier experts on the CPU pool, %d threads (%d workers%s)\n",
-                         glm_pool.workers(), cpu_pool->workers(), cpu_pool->host_works() ? " + the host thread" : "");
+                         glm_pool->workers(), cpu_pool->workers(), cpu_pool->host_works() ? " + the host thread" : "");
         }
         if (!experts.init(g, cache.valid() ? &cache : nullptr, &src, T, err)) return fail(err);
+        if (glm_pool->ready() && pool_mode < 0) {
+            // auto: the pool against staging + the GPU on the same RAM-tier experts (glm_experts.hpp
+            // calibrate_pool), the faster kept.  On epyc (23 Zen 4 workers, IQ2_S) the pool read 16.6 GB/s against
+            // 26.9 GB/s over PCIe; on the 7950X with glm-mini it was 3x faster than staging.
+            int n_cal = 256;
+            if (const char* v = std::getenv("STRATA_GLM_POOL_CALIBRATE"); v != nullptr && *v)
+                n_cal = std::max(1, std::atoi(v));
+            sc::GlmExperts::PoolCalibration c;
+            const auto tc = Clock::now();
+            if (!experts.calibrate_pool(n_cal, c, err)) return fail(err);
+            const bool keep = c.ms_pool <= c.ms_gpu;
+            std::fprintf(stderr, "strata generate: glm5-next: --glm-pool auto: %d RAM-tier experts from layer %lld on "
+                                 "(%d calls of %d tokens, %.1f MB): CPU pool %.1f ms (%.1f GB/s), staging + GPU %.1f ms "
+                                 "(%.1f GB/s): %s (calibration %.2f s)\n",
+                         c.experts, (long long) c.layer, c.calls, T, (double) c.bytes / 1e6, c.ms_pool,
+                         (double) c.bytes / 1e6 / std::max(c.ms_pool, 1e-6), c.ms_gpu,
+                         (double) c.bytes / 1e6 / std::max(c.ms_gpu, 1e-6),
+                         keep ? "the CPU pool" : "staging, the pool stopped",
+                         std::chrono::duration<double>(Clock::now() - tc).count());
+            if (!keep) {
+                experts.drop_pool();
+                glm_pool.reset();
+                cpu_pool.reset();
+            }
+        }
     }
 
     // ---- the session
@@ -248,6 +328,12 @@ int glm_generate(const GlmRunArgs& a) {
                  full ? " and the head" : " (no head: STRATA_GLM_LAYERS)", free_mib());
 
     strata::prefill::GlmPrefill prefill;
+    if (P > 0 && !pf_chosen) {   // --prefill auto without --expert-cache auto: what the session and the cache left
+        const double room = free_mib() - 512.0;
+        pf_chunk = auto_chunk(g, cfg, P, room, room, "of the " + std::to_string((long long) room) +
+                              " MiB of VRAM free above a 512 MiB margin");
+        pf_chosen = true;
+    }
     if (P > 0) {
         if (!prefill.init(eng, cache.valid() ? &cache : nullptr, any_moe ? &src : nullptr, std::min<int64_t>(pf_chunk, P),
                           err))
@@ -392,7 +478,7 @@ int glm_generate(const GlmRunArgs& a) {
         strata::kernels::cpu::ThreadAffinity prev;
         ~HostPin() { if (prev.valid) strata::kernels::cpu::restore_thread_affinity(prev); }
     } host_pin;
-    if (glm_pool.ready()) {
+    if (glm_pool && glm_pool->ready()) {
         const std::vector<int> cores = strata::kernels::cpu::physical_cores(false);
         if (!cores.empty()) host_pin.prev = strata::kernels::cpu::pin_current_thread(cores[0]);
     }

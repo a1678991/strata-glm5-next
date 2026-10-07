@@ -70,6 +70,7 @@ public:
     static size_t device_bytes(int max_t, int k, int64_t n_embd);
 
     const Stats& stats() const { return st_; }
+    void reset_stats() { st_ = Stats{}; }   ///< after a calibration (GlmExperts::calibrate_pool)
     int workers() const;
 
 private:
