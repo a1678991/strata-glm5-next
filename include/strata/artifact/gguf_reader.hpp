@@ -570,7 +570,7 @@ private:
     std::map<std::string, std::pair<size_t, const TensorInfo*>> index_;
 };
 
-// ---- architecture guard (P1.S2). The engine is specialised to ONE model; anything else must be
+// ---- architecture guard (P1.S2). The engine is specialised to the models it has kernels for; anything else must be
 // refused with a precise error rather than silently mis-run.
 struct Qwen4ExpGuard {
     uint32_t block_count = 48, hidden = 2560, experts = 0, experts_used = 0, head_count = 24,
@@ -578,6 +578,7 @@ struct Qwen4ExpGuard {
                                   // fewer experts than the canonical 512; the graph reads the true value
 };
 
+/// `qwen4exp` only, exactly as it always was (the SYCL engine and every Qwen-only caller keep this one).
 inline std::string check_architecture(const GgufFile& g, const Qwen4ExpGuard& want = {}) {
     const MetaValue* arch = g.get("general.architecture");
     if (!arch) return "missing general.architecture";
@@ -601,6 +602,140 @@ inline std::string check_architecture(const GgufFile& g, const Qwen4ExpGuard& wa
             return std::string(r.key) + " = " + std::to_string(v->u) + ", expected " + std::to_string(r.want);
     }
     return {}; // empty == ok
+}
+
+/// The architectures this engine reads.  `Glm5Next` (GLM-5.3-Flash, llama.cpp's `glm5-next`) is the second
+/// model (docs/GLM.md).
+enum class ModelArch : int { Unknown = 0, Qwen4Exp = 1, Glm5Next = 2 };
+
+inline const char* model_arch_name(ModelArch a) {
+    switch (a) {
+    case ModelArch::Qwen4Exp:
+        return "qwen4exp";
+    case ModelArch::Glm5Next:
+        return "glm5-next";
+    default:
+        return "unknown";
+    }
+}
+
+/// The `glm5-next` keys the GLM kernels are written for (`exact`) and the ones only required to be present
+/// (their values become the geometry, src/core/layout.cpp `geometry_from_gguf`).  The values are GLM-5.3-Flash's
+/// (read from the UD-IQ4_XS header on 2026-10-06; tests/data/gguf_headers), and the
+/// keys are the ones llama.cpp f1cee99 reads in `llama_model_glm5_next::load_arch_hparams` (src/models/glm5-next.cpp
+/// lines 7-59) plus the generic ones it reads for every model.
+struct Glm5NextGuard {
+    /// 45 trunk + 1 NextN (MTP) block: required of a file that carries the NextN block (nextn_predict_layers >= 1,
+    /// the real model).  A file without one is a slice of the trunk (e.g. a glm-mini fixture, docs/GLM.md: blocks 0-7 of the
+    /// real file, nextn_predict_layers 0) and may have 1 .. max_slice_blocks blocks; every per-layer array must then
+    /// have block_count entries.  The shapes of a block are the real model's either way.
+    uint32_t block_count = 46;
+    uint32_t max_slice_blocks = 45;    ///< a trunk slice holds at most the trunk
+    uint32_t hidden = 4096;
+    uint32_t head_count = 64;          ///< KDA heads and MLA query heads
+    uint32_t kda_head_dim = 128;
+    uint32_t key_length_mla = 256, value_length_mla = 256;
+    uint32_t q_lora_rank = 1536, kv_lora_rank = 512;
+    uint32_t indexer_head_count = 32, indexer_key_length = 128, indexer_kpool = 4;
+    uint32_t hc_count = 4;             ///< llama.cpp asserts 4 (G:58)
+    uint32_t rope_dimension_count = 0; ///< nope-only MLA (G:935 asserts it)
+};
+
+/// The glm5-next guard: `general.architecture == "glm5-next"`, the pinned shape keys equal, every key the geometry
+/// needs present and numeric, and `attention.head_count_kv` a per-layer array of block_count entries.  block_count is
+/// pinned (46) for a file with a NextN block and taken from the key, 1 .. 45, for a trunk slice without one.
+inline std::string check_glm5_next(const GgufFile& g, const Glm5NextGuard& want = {}) {
+    const MetaValue* arch = g.get("general.architecture");
+    if (!arch) return "missing general.architecture";
+    if (arch->s != "glm5-next") return "architecture is '" + arch->s + "', not 'glm5-next'";
+    struct Req {
+        const char* key;
+        bool exact;
+        uint64_t want;
+    };
+    const Req reqs[] = {
+        {"glm5-next.block_count", false, 0},
+        {"glm5-next.embedding_length", true, want.hidden},
+        {"glm5-next.attention.head_count", true, want.head_count},
+        {"glm5-next.kda.head_dim", true, want.kda_head_dim},
+        {"glm5-next.attention.key_length_mla", true, want.key_length_mla},
+        {"glm5-next.attention.value_length_mla", true, want.value_length_mla},
+        {"glm5-next.attention.q_lora_rank", true, want.q_lora_rank},
+        {"glm5-next.attention.kv_lora_rank", true, want.kv_lora_rank},
+        {"glm5-next.attention.indexer.head_count", true, want.indexer_head_count},
+        {"glm5-next.attention.indexer.key_length", true, want.indexer_key_length},
+        {"glm5-next.attention.indexer.kpool", true, want.indexer_kpool},
+        {"glm5-next.hyper_connection.count", true, want.hc_count},
+        {"glm5-next.rope.dimension_count", true, want.rope_dimension_count},
+        {"glm5-next.expert_count", false, 0},
+        {"glm5-next.expert_used_count", false, 0},
+        {"glm5-next.expert_shared_count", false, 0},
+        {"glm5-next.expert_feed_forward_length", false, 0},
+        {"glm5-next.feed_forward_length", false, 0},
+        {"glm5-next.leading_dense_block_count", false, 0},
+        {"glm5-next.attention.indexer.top_k", false, 0},
+        {"glm5-next.ssm.conv_kernel", false, 0},
+        {"glm5-next.hyper_connection.sinkhorn_iterations", false, 0},
+        {"glm5-next.hyper_connection.epsilon", false, 0},
+        {"glm5-next.attention.layer_norm_rms_epsilon", false, 0},
+        {"glm5-next.attention.layer_norm_epsilon", false, 0},
+    };
+    for (const auto& r : reqs) {
+        const MetaValue* v = g.get(r.key);
+        if (!v) return std::string("missing ") + r.key;
+        if (!v->is_num()) return std::string(r.key) + " is not a number";
+        if (r.exact && (v->type == MetaType::F32 || v->type == MetaType::F64 || v->u != r.want))
+            return std::string(r.key) + " = " + std::to_string((long long) v->num()) + ", expected " +
+                   std::to_string(r.want);
+    }
+    // the block count: pinned for the real model (it carries the NextN block), from the key for a trunk slice
+    const MetaValue* bc = g.get("glm5-next.block_count");
+    if (bc->type == MetaType::F32 || bc->type == MetaType::F64) return "glm5-next.block_count is not an integer";
+    const MetaValue* nextn = g.get("glm5-next.nextn_predict_layers");
+    if (nextn && !nextn->is_num()) return "glm5-next.nextn_predict_layers is not a number";
+    const uint64_t n_nextn = nextn ? nextn->u : 0;
+    uint64_t blocks = bc->u;
+    if (n_nextn > 0) {
+        if (blocks != want.block_count)
+            return "glm5-next.block_count = " + std::to_string(blocks) + ", expected " +
+                   std::to_string(want.block_count) + " (a file with a NextN block is the whole model)";
+    } else if (blocks < 1 || blocks > want.max_slice_blocks) {
+        return "glm5-next.block_count = " + std::to_string(blocks) + " without a NextN block: a trunk slice has 1 .. " +
+               std::to_string(want.max_slice_blocks) + " blocks";
+    }
+    const MetaValue* kv = g.get("glm5-next.attention.head_count_kv");
+    if (!kv) return "missing glm5-next.attention.head_count_kv";
+    if (kv->type != MetaType::ARRAY || kv->count != blocks || kv->items.size() != kv->count)
+        return "glm5-next.attention.head_count_kv must be a per-layer array of " + std::to_string(blocks) +
+               " entries (the layer types come from it)";
+    // the other per-layer keys llama.cpp reads with get_key_or_arr: a scalar, or an array of block_count entries
+    for (const char* key : {"glm5-next.expert_feed_forward_length", "glm5-next.swiglu_clamp_exp",
+                            "glm5-next.swiglu_clamp_shexp"}) {
+        const MetaValue* v = g.get(key);
+        if (v && v->type == MetaType::ARRAY && (v->count != blocks || v->items.size() != v->count))
+            return std::string(key) + " must be one value or a per-layer array of " + std::to_string(blocks) +
+                   " entries";
+    }
+    return {};
+}
+
+/// Every architecture the CUDA/HIP engine reads: `qwen4exp` through `check_architecture` (unchanged), `glm5-next`
+/// through `check_glm5_next`.  `arch` (optional) receives which one it was, or Unknown on a refusal.
+inline std::string check_model_architecture(const GgufFile& g, ModelArch* arch = nullptr) {
+    if (arch) *arch = ModelArch::Unknown;
+    const MetaValue* a = g.get("general.architecture");
+    if (!a) return "missing general.architecture";
+    if (a->s == "qwen4exp") {
+        std::string err = check_architecture(g);
+        if (err.empty() && arch) *arch = ModelArch::Qwen4Exp;
+        return err;
+    }
+    if (a->s == "glm5-next") {
+        std::string err = check_glm5_next(g);
+        if (err.empty() && arch) *arch = ModelArch::Glm5Next;
+        return err;
+    }
+    return "architecture is '" + a->s + "', this engine requires 'qwen4exp' or 'glm5-next'";
 }
 
 } // namespace strata

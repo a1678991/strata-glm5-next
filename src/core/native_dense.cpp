@@ -86,9 +86,15 @@ std::vector<uint8_t> q8_0_of(const float* x, uint64_t n) {
     }
     return out;
 }
-bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
+/// `glm`: a glm5-next file.  Its pack (tools/iq_pack.py) keeps EVERY quantized non-expert tensor in its GGUF form
+/// with no bytes in dense.bin (the dense FFN of layers 0-2, KDA's q/k/v/f/g/beta, MLA's q_a/q_b/kv_a/k_b/v_b, mHC's
+/// hc_*_fn, the indexer's projections, the shared expert), so all of them are served from the GGUF; the F32 rows
+/// (norms, router, biases, conv taps) stay in the arena because native_mmvq has no F32 path.  A qwen4exp file keeps
+/// its suffix list exactly.
+bool eligible(const strata::TensorInfo& tensor, bool include_ple_key, bool glm) {
     const auto& name = tensor.name;
     if (name.rfind("blk.", 0) != 0) return false;
+    if (glm) return !name.ends_with("_exps.weight");   // the routed experts are the expert tiers' business
     // Match the native PLE kernel: Q2_0, IQ3_XXS, IQ4_XS and Q8_0 (UD-Q4_K_XL). Other keys retain the packed BF16
     // fallback.
     if (name == "blk.1.ple_key.weight")
@@ -98,6 +104,22 @@ bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
         ".ffn_gate_shexp.weight", ".ffn_up_shexp.weight", ".ffn_down_shexp.weight"};
     for (const char* suffix : suffixes) if (name.ends_with(suffix)) return true;
     return false;
+}
+/// A GGUF tensor as the 2-D matrix the pack's row describes.  glm5-next's pack flattens its 3-D non-expert tensors
+/// to [ne0, ne1 * ne2] (attn_k_b / attn_v_b [256, 512, 64] -> [256, 32768]); the bytes are the same.  Other files:
+/// 2-D tensors only, as before.
+bool matrix_shape(const strata::TensorInfo& tensor, bool glm, uint64_t& ne0, uint64_t& ne1) {
+    if (tensor.shape.size() == 2 || (glm && tensor.shape.size() == 3)) {
+        ne0 = tensor.shape[0];
+        ne1 = tensor.shape[1] * (tensor.shape.size() == 3 ? tensor.shape[2] : 1);
+        return true;
+    }
+    return false;
+}
+/// Whether this shard is a glm5-next metadata shard.
+bool glm_meta(const strata::GgufFile& gguf) {
+    const strata::MetaValue* arch = gguf.get("general.architecture");
+    return arch != nullptr && arch->s == "glm5-next";
 }
 struct DeviceFree { void operator()(void* p) const { if (p) cudaFree(p); } };
 using DevicePtr = std::unique_ptr<void, DeviceFree>;
@@ -113,11 +135,14 @@ struct Pending {
 bool NativeDense::served_names(const std::vector<std::string>& shards, bool include_ple_key,
                                std::set<std::string>& out, std::string& err) {
     try {
+        bool glm = false;   // the metadata shard comes first (strata::gguf_split_paths)
         for (const auto& path : shards) {
             strata::GgufFile gguf(path);
+            glm = glm || glm_meta(gguf);
+            uint64_t ne0 = 0, ne1 = 0;
             for (const auto& tensor : gguf.tensors())
-                if (eligible(tensor, include_ple_key) && strata::kernels::native_mmvq_supported(tensor.type) &&
-                    tensor.shape.size() == 2)
+                if (eligible(tensor, include_ple_key, glm) && strata::kernels::native_mmvq_supported(tensor.type) &&
+                    matrix_shape(tensor, glm, ne0, ne1))
                     out.insert(tensor.name);
         }
         return true;
@@ -141,7 +166,8 @@ bool NativeDense::weight_bytes_for(const std::vector<std::string>& shards, Weigh
         for (const auto& path : shards) {
             strata::GgufFile gguf(path);
             for (const auto& tensor : gguf.tensors()) {
-                if (!eligible(tensor, include_ple_key)) continue;
+                // the layer split prices Qwen stages only (glm5-next runs on one GPU): the qwen4exp list
+                if (!eligible(tensor, include_ple_key, false)) continue;
                 if (tensor.name.rfind("blk.", 0) == 0) {
                     const long l = std::strtol(tensor.name.c_str() + 4, nullptr, 10);
                     if (l < lb || l >= le) continue;
@@ -204,6 +230,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         uint64_t split_count = 0, split_tensors = 0;
         std::set<uint64_t> split_numbers;
         bool have_architecture = false;
+        bool glm = false;
         for (const auto& path : shards) {
             strata::GgufFile gguf(path);
             const auto* count = gguf.get("split.count");
@@ -211,9 +238,11 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
             const auto* tensors = gguf.get("split.tensors.count");
             if (gguf.get("general.architecture") && (!number || number->u == 0)) {
                 // splitter may copy general.architecture into every shard (Huihui abliterated re-split)
-                err = strata::check_architecture(gguf);
+                strata::ModelArch arch = strata::ModelArch::Unknown;
+                err = strata::check_model_architecture(gguf, &arch);
                 if (!err.empty()) return false;
                 have_architecture = true;
+                glm = arch == strata::ModelArch::Glm5Next;
                 if (count && number && tensors && number->u == 0 && count->u > 1) {
                     split_count = count->u;
                     split_tensors = tensors->u;
@@ -262,12 +291,12 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     err = "native dense: overlapping payload " + tensor.name; return false;
                 }
                 // the uploads below read these: ask for them now so the reads overlap
-                if (eligible(tensor, include_ple_key) && !outside(tensor.name) &&
+                if (eligible(tensor, include_ple_key, glm) && !outside(tensor.name) &&
                     strata::kernels::native_mmvq_supported(tensor.type))
                     strata::platform::advise_willneed(gguf.tensor_data(tensor), bytes);
             }
             for (const auto& tensor : gguf.tensors()) {
-                if (!eligible(tensor, include_ple_key) || outside(tensor.name)) continue;
+                if (!eligible(tensor, include_ple_key, glm) || outside(tensor.name)) continue;
                 if (!in_range(tensor.name) && tensor.name.find("ple") == std::string::npos) continue;
                 if (!seen.insert(tensor.name).second) {
                     err = "native dense: duplicate tensor " + tensor.name; return false;
@@ -281,9 +310,10 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 if (!strata::kernels::native_mmvq_supported(tensor.type)) continue;
                 // #326: the pack keeps an unquantized (--compat-bf16) key, which the PLE reads from the arena
                 if (tensor.name == "blk.1.ple_key.weight" && !ref.quantized()) continue;
-                if (!ref.quantized() || tensor.shape.size() != 2 ||
+                uint64_t ne0 = 0, ne1 = 0;
+                if (!ref.quantized() || !matrix_shape(tensor, glm, ne0, ne1) ||
                     ref.ne0 <= 0 || ref.ne0 > INT_MAX || ref.ne1 <= 0 || ref.ne1 > INT_MAX ||
-                    tensor.shape[0] != (uint64_t) ref.ne0 || tensor.shape[1] != (uint64_t) ref.ne1) {
+                    ne0 != (uint64_t) ref.ne0 || ne1 != (uint64_t) ref.ne1) {
                     err = "native dense: incompatible matrix " + tensor.name; return false;
                 }
                 const auto bytes = strata::kernels::native_mmvq_weight_bytes(
