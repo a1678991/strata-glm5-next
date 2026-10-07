@@ -85,6 +85,43 @@ double free_mib() {
     return (double) f / 1048576.0;
 }
 
+// --prefill auto: the chunk sizes it tries, largest first.  Measured on the RTX 3090 (UD-IQ3_XXS, 16,376-token
+// prompt, window 2): 8,192 read at 281.9 tok/s with 2,862 MiB of buffers, 4,096 at 155.4 with 1,606.
+constexpr int64_t kAutoChunks[] = {8192, 4096, 2048};
+
+// With --expert-cache auto the prompt buffers come out of the expert cache's VRAM: the largest chunk whose buffers
+// take at most this share of what the two share (default 25%; STRATA_GLM_PREFILL_SHARE=<percent>).  On the 3090
+// 8,192's buffers are 18.6% of it and cost the cache ~147 of ~1,600 experts (~2% of the lookups move to RAM).
+double auto_share() {
+    const char* v = std::getenv("STRATA_GLM_PREFILL_SHARE");
+    return v != nullptr && *v ? std::max(0.0, std::min(100.0, std::atof(v))) / 100.0 : 0.25;
+}
+
+// The largest of kAutoChunks (each capped at the prompt) whose buffers fit `limit` MiB, else the smallest; logged.
+int64_t auto_chunk(const sc::ModelGeometry& g, const sc::GlmConfig& cfg, int64_t P, double limit, double room,
+                   const std::string& what) {
+    std::string tried;
+    int64_t pick = 0;
+    double pick_mib = 0;
+    for (const int64_t c : kAutoChunks) {
+        const double mib = (double) strata::prefill::GlmPrefill::bytes_needed(g, cfg, std::min(c, P)) / 1048576.0;
+        char b[64];
+        std::snprintf(b, sizeof b, "%s%lld: %.0f MiB", tried.empty() ? "" : ", ", (long long) c, mib);
+        tried += b;
+        if (pick == 0 && mib <= limit) { pick = c; pick_mib = mib; }
+    }
+    const bool fits = pick != 0;
+    if (!fits) {
+        pick = kAutoChunks[sizeof kAutoChunks / sizeof kAutoChunks[0] - 1];
+        pick_mib = (double) strata::prefill::GlmPrefill::bytes_needed(g, cfg, std::min(pick, P)) / 1048576.0;
+    }
+    std::fprintf(stderr, "strata generate: glm5-next: --prefill auto: chunks of %lld tokens (%.0f MiB of buffers, %.1f%% "
+                         "%s%s; %s)\n",
+                 (long long) std::min(pick, P), pick_mib, room > 0 ? 100.0 * pick_mib / room : 0.0, what.c_str(),
+                 fits ? "" : "; none fits, the smallest taken", tried.c_str());
+    return pick;
+}
+
 }  // namespace
 
 int glm_generate(const GlmRunArgs& a) {
@@ -108,9 +145,12 @@ int glm_generate(const GlmRunArgs& a) {
     const bool full = n_run == g.n_layers;
     const int T = std::max(1, std::min(8, a.window));
     const int64_t max_cells = std::max<int64_t>(a.max_context, (int64_t) a.tokens.size() + std::max<int64_t>(0, a.max_new));
-    // the prompt path: positions [0, P) in chunks (--prefill N, or auto: 4,096 tokens, see glm_prefill.hpp)
+    // the prompt path: positions [0, P) in chunks (--prefill N, or auto: the largest of kAutoChunks that fits, chosen
+    // below where the VRAM is budgeted: with --expert-cache auto before the cache is sized, else from the VRAM left
+    // once the session is in)
     const int64_t n_tok = (int64_t) a.tokens.size();
-    const int64_t pf_chunk = a.prefill_auto ? 4096 : a.prefill_chunk;
+    int64_t pf_chunk = a.prefill_auto ? kAutoChunks[0] : a.prefill_chunk;
+    bool pf_chosen = !a.prefill_auto;
     int64_t P = 0;
     if (pf_chunk > 0) {
         P = a.prefill_until > 0 ? std::min<int64_t>(a.prefill_until, n_tok) : std::max<int64_t>(1, n_tok - 1);
@@ -181,9 +221,20 @@ int glm_generate(const GlmRunArgs& a) {
             const int64_t n_pre = pre != nullptr ? std::max<int64_t>(0, std::min<int64_t>(64, std::atoll(pre))) : 0;
             const double staging = (double) (T * g.n_expert_used + n_pre) * (double) lay.max_blob / 1048576.0;
             probe.n_run = n_run;
+            double room = free_mib() - session - staging - 512.0 - (double) a.vram_reserve_mib;
+            if (P > 0 && !pf_chosen) {   // --prefill auto: the chunk first, then the cache gets the rest
+                // (the share, or whatever the cache cannot use once every expert is in it)
+                double all = 0;
+                for (const auto& [l, e] : ranked) all += (double) lay.blob_bytes(l) / 1048576.0;
+                pf_chunk = auto_chunk(g, probe, P, std::max(auto_share() * room, room - all), room, "of the " +
+                                      std::to_string((long long) room) + " MiB the expert cache and the prompt "
+                                      "buffers share; at most " + std::to_string((int) (100 * auto_share())) +
+                                      "% or what every expert (" + std::to_string((long long) all) + " MiB) leaves");
+                pf_chosen = true;
+            }
             const double prompt = P > 0 ? (double) strata::prefill::GlmPrefill::bytes_needed(
                                               g, probe, std::min<int64_t>(pf_chunk, P)) / 1048576.0 : 0.0;
-            double room = free_mib() - session - staging - prompt - 512.0 - (double) a.vram_reserve_mib;
+            room -= prompt;
             want = 0;
             for (const auto& [l, e] : ranked) {
                 const double b = (double) lay.blob_bytes(l) / 1048576.0;
@@ -248,6 +299,12 @@ int glm_generate(const GlmRunArgs& a) {
                  full ? " and the head" : " (no head: STRATA_GLM_LAYERS)", free_mib());
 
     strata::prefill::GlmPrefill prefill;
+    if (P > 0 && !pf_chosen) {   // --prefill auto without --expert-cache auto: what the session and the cache left
+        const double room = free_mib() - 512.0;
+        pf_chunk = auto_chunk(g, cfg, P, room, room, "of the " + std::to_string((long long) room) +
+                              " MiB of VRAM free above a 512 MiB margin");
+        pf_chosen = true;
+    }
     if (P > 0) {
         if (!prefill.init(eng, cache.valid() ? &cache : nullptr, any_moe ? &src : nullptr, std::min<int64_t>(pf_chunk, P),
                           err))
