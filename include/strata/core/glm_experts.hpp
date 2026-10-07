@@ -18,6 +18,7 @@
 #pragma once
 
 #include "strata/core/glm.hpp"
+#include "strata/core/glm_fetch.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/router_sigmoid.hpp"
 
@@ -62,6 +63,12 @@ public:
     /// out (T x n_embd) = the MoE block of layer w.layer on x (T x n_embd, the ffn_norm output).  Synchronizes once
     /// (the router's ids).
     bool moe(const GlmLayerWeights& w, const float* x, int T, float* out, void* stream, std::string& err);
+    /// The lookahead (glm_fetch.hpp): called right before `moe` of a layer with the NEXT MoE layer's weights
+    /// and the same x; enqueues that layer's router on x so that `moe` can start reading its predicted experts.
+    void predict(const GlmLayerWeights& next, const float* x, int T, void* stream) { fetch_.predict(next, x, T, stream); }
+    bool lookahead() const { return fetch_.lookahead(); }
+    /// "glm fetch: ..." (the file tier's reader, slots, lookahead and predictor statistics).
+    std::string fetch_line() const { return fetch_.stats_line(); }
 
     const Stats& stats() const { return st_; }
     /// The tiers line: "glm experts: N entries, G experts: V vram, R ram, F file (P MB staged, X ms)".
@@ -71,6 +78,10 @@ public:
     const float* last_weights() const { return h_w_; }
 
 private:
+    /// One RAM- or file-tier miss into the VRAM staging slot `dst`, on the copy stream.
+    bool stage_miss(int64_t l, int32_t e, bool from_file, uint8_t* dst, uint64_t blob, std::string& err);
+    /// After a layer call, the lookahead's landed blobs into the VRAM slots `pre_` (see the .cpp).
+    void prestage();
     ModelGeometry g_;
     ExpertCache* cache_ = nullptr;
     FileExpertSource* src_ = nullptr;
@@ -83,10 +94,19 @@ private:
     void *xq_ = nullptr, *scratch_ = nullptr, *ffn_scratch_ = nullptr;
     uint8_t* staging_ = nullptr;          ///< max_t * k slots of the largest blob
     uint64_t slot_bytes_ = 0;
-    // the plan: grp_ptr [cap] u64 | grp_start [cap + 1] | n_groups [1] | ent_dst [cap] | ent_tok [cap], device and pinned
+    // the plan: grp_ptr [cap] u64 | grp_start [cap + 1] | n_groups [1] | ent_dst [cap] | ent_tok [cap], device and pinned;
+    // two of them back to back: the groups whose bytes are in VRAM first (cache hits and the RAM tier's
+    // copies), computed while the file tier's reads land, then the file tier's
     void* plan_ = nullptr;
     void* h_plan_ = nullptr;
     uint64_t plan_bytes_ = 0;
+    void* copy_ = nullptr;                ///< the staging copies' stream
+    void* ev_ram_ = nullptr;              ///< the RAM tier's copies have landed
+    void* ev_file_ = nullptr;             ///< the file tier's copies have landed
+    GlmFetch fetch_;
+    uint8_t* pre_ = nullptr;              ///< VRAM slots for lookahead blobs copied ahead (fetch_.prestage_slots())
+    std::vector<int64_t> pre_key_;        ///< per slot: layer * n_expert + expert, -1 empty
+    std::vector<char> pre_used_;
     int32_t* h_ids_ = nullptr;
     float* h_w_ = nullptr;
     GlmPool* gp_ = nullptr;
