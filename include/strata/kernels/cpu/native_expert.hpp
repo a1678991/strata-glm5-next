@@ -13,10 +13,21 @@
 
 namespace strata::kernels::cpu {
 
-/// Bytes of the largest quantized activation any native layer uses (2560 values as Q8_K: 10 x 292).
-inline constexpr size_t kNativeActBytes = 4096;
-/// Bytes of the largest quantized down activation (640 values as Q8_0: 20 x 34, or Q8_K 3 x 292).
-inline constexpr size_t kNativeHBytes = 1024;
+/// The widest expert of the architectures this engine reads: qwen4exp 2560 / 640, glm5-next 4096 / 2048.  The
+/// pool's native buffers below are sized for these; a layer's own widths are its `NativeFmt::n_embd` / `n_ff`.
+inline constexpr int64_t kNativeMaxEmbd = 4096;
+inline constexpr int64_t kNativeMaxFF = 2048;
+/// The largest activation size per 256 values among the vec_dot types of the expert formats with GPU kernels: Q8_K
+/// (292 B; Q8_1 is 288, Q8_0 272).  F16/BF16/F32 experts have no GPU kernel, and native_fmt refuses them here.
+inline constexpr size_t kNativeActPer256 = 292;
+/// Bytes of the largest quantized activation any native layer uses: n_embd as Q8_K.  Qwen 2560: 2,920 (this was
+/// 4096 when it was the only model); GLM 4096: 16 x 292 = 4,672 (a multiple of 64).
+inline constexpr size_t kNativeActBytes = (size_t) kNativeMaxEmbd / 256 * kNativeActPer256;
+/// Bytes of the largest quantized down activation: n_ff as Q8_K, rounded up to 64 B.  Qwen 640: Q8_0 680 (this was
+/// 1024); GLM 2048: 8 x 292 = 2,336 -> 2,368.
+inline constexpr size_t kNativeHBytes = ((size_t) kNativeMaxFF / 256 * kNativeActPer256 + 63) / 64 * 64;
+static_assert(kNativeActBytes == 4672 && kNativeHBytes == 2368, "the native activation caps");
+static_assert(kNativeActBytes >= 4096 && kNativeHBytes >= 1024, "never below the Qwen-only caps");
 
 /// One layer's native expert geometry.
 struct NativeFmt {

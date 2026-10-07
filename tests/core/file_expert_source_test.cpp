@@ -274,6 +274,13 @@ void test_complement_plan() {
     require(!make_cache_complement_plan(2, 3, {3, 5}, {{2, 0}}, {}, offsets, bytes, error),
             "out-of-range pair accepted");
     require(!make_cache_complement_plan(2, 3, {0, 5}, {}, {}, offsets, bytes, error), "zero-size layer accepted");
+    // a layer without experts (glm5-next's dense lead) when the caller allows it: nothing of it in the complement
+    require(make_cache_complement_plan(2, 3, {0, 5}, {{1, 0}}, {}, offsets, bytes, error, true), error);
+    require(bytes == 10 && offsets == std::vector<uint64_t>{kNoCacheComplement, kNoCacheComplement, kNoCacheComplement,
+                                                            kNoCacheComplement, 0, 5},
+            "a layer without experts took complement bytes");
+    require(!make_cache_complement_plan(2, 3, {0, 5}, {{0, 1}}, {}, offsets, bytes, error, true),
+            "a GPU pair in a layer without experts accepted");
 }
 
 void test_resident_lend_region() {

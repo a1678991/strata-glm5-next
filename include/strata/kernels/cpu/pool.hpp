@@ -290,7 +290,9 @@ private:
     int64_t mrows_ = 0;     // rows of the current multi phase across all its experts (n * FF, then n * H)
     int mtasks_ = 1;        // equal row ranges the phase is cut into
     struct SplitBufMulti {
-        alignas(64) float ff[MAXT][FF];
+        // the widest intermediate of the supported architectures: the Q2_0 path uses FF (640) of each row, a
+        // native layer its own n_ff (640 Qwen, 2048 GLM)
+        alignas(64) float ff[MAXT][kNativeMaxFF];
         ActQ a2[MAXT];
         alignas(64) uint8_t hq[MAXT][kNativeHBytes];   // plan v0.3 P6: native down activations
     };
