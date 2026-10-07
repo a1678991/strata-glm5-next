@@ -488,6 +488,43 @@ __device__ __forceinline__ float vec_dot_q8_0_q8_1(const void* __restrict__ vbq,
     return d8_0 * d8_1 * ((float) sumi);
 }
 
+// GLM-5.3-Flash's Q6_K down rows (layers 11, 12, 44): llama.cpp's vec_dot_q6_K_q8_1 (vecdotq.cuh, VDR 1),
+// transcribed.  The pinned ggml writes the -32 offset as __vsubss4, f1cee99 as __vsub4: (vil | vih) is 0..63, so the
+// byte-wise difference never saturates and both give the same bits.
+constexpr int VDR_Q6_K = 1;
+__device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(const int& vl, const int& vh, const int* __restrict__ u,
+                                                             const int8_t* __restrict__ scales, const float& d,
+                                                             const float* __restrict__ d8) {
+    float sumf = 0.0f;
+#pragma unroll
+    for (int i = 0; i < QR6_K; ++i) {
+        const int sc = scales[4 * i];
+        const int vil = (vl >> (4 * i)) & 0x0F0F0F0F;
+        const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
+        const int vi = __vsubss4((vil | vih), 0x20202020);   // vi = (vil | vih) - 32
+        sumf += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * sc);
+    }
+    return d * sumf;
+}
+__device__ __forceinline__ float vec_dot_q6_K_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
+                                                   const int& kbx, const int& iqs) {
+    const block_q6_K* bq6_K = (const block_q6_K*) vbq + kbx;
+    const int bq8_offset = 2 * QR6_K * (iqs / (QI6_K / 2)) + (iqs % (QI6_K / 2)) / (QI6_K / 4);
+    const int scale_offset = (QI6_K / 4) * (iqs / (QI6_K / 2)) + (iqs % (QI6_K / 2)) / (QI6_K / 8);
+    const int vh_shift = 2 * ((iqs % (QI6_K / 2)) / (QI6_K / 4));
+    const int vl = get_int_b2(bq6_K->ql, iqs);
+    const int vh = get_int_b2(bq6_K->qh, (QI6_K / 4) * (iqs / (QI6_K / 2)) + iqs % (QI6_K / 4)) >> vh_shift;
+    const int8_t* scales = bq6_K->scales + scale_offset;
+    int u[QR6_K];
+    float d8[QR6_K];
+#pragma unroll
+    for (int i = 0; i < QR6_K; ++i) {
+        u[i] = get_int_b4(bq8_1[bq8_offset + 2 * i].qs, iqs % QI8_1);
+        d8[i] = __low2float(bq8_1[bq8_offset + 2 * i].ds);
+    }
+    return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, __half2float(bq6_K->d), d8);
+}
+
 // ---------------------------------------------------------------- the formats
 // qk = values per block, ipb = dot calls per block (qi / vdr), step = the iqs stride between calls.
 template<int TY> struct Fmt;
@@ -519,11 +556,15 @@ template<> struct Fmt<6> { static constexpr int qk = 32, ipb = QI5_0 / VDR_Q5_0,
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q5_0_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<8> { static constexpr int qk = 32, ipb = QI8_0 / VDR_Q8_0, step = VDR_Q8_0;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q8_0_q8_1(v, y, kbx, iqs); } };
+template<> struct Fmt<14> { static constexpr int qk = 256, ipb = QI6_K / VDR_Q6_K, step = VDR_Q6_K;
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q6_K_q8_1(v, y, kbx, iqs); } };
 
 // The formats of each role, one list each so a type cannot be in one switch and missing from another.  Every
 // entry is a kernel template for each CUDA architecture of the build, hence two lists rather than one.
+// Down: IQ3_S (21) for GLM-5.3-Flash UD-IQ3_XXS (39 layers IQ2_S / IQ3_S) - the gate/up role's Fmt<21> and Split<21>,
+// so its down rows are the same dot products as its gate/up rows; adding the case changes no other type's kernels.
 #define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(6) X(8)
-#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(8)
+#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(8) X(14) X(21)
 #define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(8)
 
 __device__ __forceinline__ float warp_sum(float v) {
@@ -1143,10 +1184,25 @@ __global__ void __launch_bounds__(256) native_gu_multi_kernel(const unsigned lon
     }
 }
 
+// GLM-5.3-Flash's clamped SwiGLU, ggml_compute_forward_swiglu_clamp_f32 (ggml-cpu ops.cpp 3614-3615 at f1cee99):
+// gate = std::min(gate, limit), up = std::clamp(up, -limit, limit) - written as those two functions' comparisons, so
+// a NaN passes through as it does there.  Applied only when NativeExpertLayout::swiglu_limit > 0; the unclamped
+// expression below each call site is the one it always was (Qwen's experts: swiglu_limit 0).
+__device__ __forceinline__ void swiglu_clamp_inputs(float& g, float& u, float limit) {
+    g = limit < g ? limit : g;
+    u = u < -limit ? -limit : (limit < u ? limit : u);
+}
+
 __global__ void swiglu_entries_kernel(const float* __restrict__ gate, const float* __restrict__ up, float* __restrict__ h,
-                                      long long n) {
+                                      long long n, float limit) {
     const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
+    if (limit > 0.0f) {
+        float g = gate[i], u = up[i];
+        swiglu_clamp_inputs(g, u, limit);
+        h[i] = (g / (1.0f + __expf(-g))) * u;
+        return;
+    }
     const float g = gate[i];
     h[i] = (g / (1.0f + __expf(-g))) * up[i];
 }
@@ -1361,11 +1417,25 @@ __global__ void __launch_bounds__(256) swiglu_q8_1_entries_kernel(const float* _
                                                                   const float* __restrict__ up,
                                                                   const int32_t* __restrict__ grp_start,
                                                                   const int32_t* __restrict__ n_groups, int n_ff,
-                                                                  block_q8_1* __restrict__ hq) {
+                                                                  block_q8_1* __restrict__ hq, float limit) {
 #if defined(__HIPCC__)
 #pragma clang fp contract(off)
 #endif
     const long long lo = (long long) grp_start[0] * n_ff, hi = (long long) grp_start[*n_groups] * n_ff;
+    if (limit > 0.0f) {   // GLM-5.3-Flash: swiglu_entries_kernel's clamp, then the same product and q8_1_store
+        for (long long i = lo + (long long) blockIdx.x * blockDim.x + threadIdx.x; i < hi;
+             i += (long long) gridDim.x * blockDim.x) {
+            float g = gate[i], u = up[i];
+            swiglu_clamp_inputs(g, u, limit);
+#if defined(__HIPCC__)
+            const float h = (g / (1.0f + __expf(-g))) * u;
+#else
+            const float h = __fmul_rn(g / (1.0f + __expf(-g)), u);
+#endif
+            q8_1_store(h, hq, i);
+        }
+        return;
+    }
     for (long long i = lo + (long long) blockIdx.x * blockDim.x + threadIdx.x; i < hi;
          i += (long long) gridDim.x * blockDim.x) {
         const float g = gate[i];
@@ -1630,6 +1700,24 @@ __device__ void dq_q8_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     for (int j = 0; j < 8; ++j) y[j] = cvt<dst_t>((float) x[ib].qs[8 * il + j] * d);
 }
 
+// llama.cpp's dequantize_q6_K (dequantize.cuh; its 64 threads folded onto 32): GLM-5.3-Flash's Q6_K down rows
+template<typename dst_t>
+__device__ void dq_q6_k(const void* vx, int64_t ib, dst_t* yy, int tid) {
+    const block_q6_K* x = (const block_q6_K*) vx;
+    for (int tt = tid; tt < 64; tt += 32) {
+        const int64_t ip = tt / 32, il = tt - 32 * ip, is = 8 * ip + il / 16;
+        dst_t* y = yy + 128 * ip + il;
+        const float d = __half2float(x[ib].d);
+        const uint8_t* ql = x[ib].ql + 64 * ip + il;
+        const uint8_t qh = x[ib].qh[32 * ip + il];
+        const int8_t* sc = x[ib].scales + is;
+        y[0] = cvt<dst_t>(d * sc[0] * ((int8_t) ((ql[0] & 0xF) | (((qh >> 0) & 3) << 4)) - 32));
+        y[32] = cvt<dst_t>(d * sc[2] * ((int8_t) ((ql[32] & 0xF) | (((qh >> 2) & 3) << 4)) - 32));
+        y[64] = cvt<dst_t>(d * sc[4] * ((int8_t) ((ql[0] >> 4) | (((qh >> 4) & 3) << 4)) - 32));
+        y[96] = cvt<dst_t>(d * sc[6] * ((int8_t) ((ql[32] >> 4) | (((qh >> 6) & 3) << 4)) - 32));
+    }
+}
+
 // BF16 (the token embedding as the checkpoint ships it, tools/embd_bf16_pack.py): 8 values per thread.
 template<typename dst_t>
 __device__ void dq_bf16(const void* vx, int64_t ibs, dst_t* yy, int tid) {
@@ -1637,8 +1725,8 @@ __device__ void dq_bf16(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     for (int j = 0; j < 8; ++j) yy[tid * 8 + j] = cvt<dst_t>(__uint_as_float((uint32_t) x[j] << 16));
 }
 
-// Every type below must also be in is_iq() (BF16: embed_type_supported): the host entry points refuse the others,
-// so the default is unreachable.
+// Every type below must also be in is_iq() (BF16: embed_type_supported; Q6_K: is_dq) - the host entry points refuse
+// the others, so the default is unreachable.
 template<typename dst_t>
 __device__ __forceinline__ void dq_dispatch(int ty, const void* vx, int64_t ibs, dst_t* y, int tid) {
     switch (ty) {
@@ -1657,6 +1745,7 @@ __device__ __forceinline__ void dq_dispatch(int ty, const void* vx, int64_t ibs,
         case 7: dq_q5_1(vx, ibs, y, tid); break;
         case 6: dq_q5_0(vx, ibs, y, tid); break;
         case 8: dq_q8_0(vx, ibs, y, tid); break;
+        case 14: dq_q6_k(vx, ibs, y, tid); break;
         case 30: dq_bf16(vx, ibs, y, tid); break;
         default: break;
     }
@@ -1682,6 +1771,9 @@ bool is_iq(int t) {
     return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11 ||
            t == 12 || t == 13 || t == 7 || t == 6 || t == 8;
 }
+// is_iq plus Q6_K (GLM-5.3-Flash's down rows): the expert path and its prompt dequantizers take it.  Kept apart from
+// is_iq so iq_supported / embed_type_supported - which the engine's embedding loader asks - answer as before.
+bool is_dq(int t) { return is_iq(t) || t == 14; }
 // values per block of the types the grouped expert kernels take (0 = none)
 int gu_qk(int t) {
     switch (t) {
@@ -1776,6 +1868,7 @@ bool iq_old_kernels() { return g_old_kernels; }
 
 bool iq_supported(int t) noexcept { return is_iq(t); }
 bool embed_type_supported(int t) noexcept { return is_iq(t) || t == 30; }
+bool glm_embed_type_supported(int t) noexcept { return embed_type_supported(t) || t == 14; }
 
 size_t iq_row_bytes(int t, int64_t n) noexcept {
     switch (t) {
@@ -1794,6 +1887,7 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
         case 7: return (size_t) (n / 32) * sizeof(block_q5_1);
         case 6: return (size_t) (n / 32) * sizeof(block_q5_0);
         case 8: return (size_t) (n / 32) * sizeof(block_q8_0);
+        case 14: return (size_t) (n / 256) * sizeof(block_q6_K);   // GLM-5.3-Flash's Q6_K down rows
         case 30: return (size_t) n * 2;   // BF16: the token embedding only (iq_embed_rows, iq_dequant_f32)
         default: return 0;
     }
@@ -1821,7 +1915,7 @@ void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n
 }
 
 void iq_dequant_f16(int t, const void* src, int64_t n, uint16_t* dst, void* stream) {
-    if (n % 256 != 0 || !is_iq(t)) { std::fprintf(stderr, "iq_dequant_f16: bad arguments\n"); std::exit(1); }
+    if (n % 256 != 0 || !is_dq(t)) { std::fprintf(stderr, "iq_dequant_f16: bad arguments\n"); std::exit(1); }
     dequant_flat_kernel<__half><<<(unsigned) (n / 256), 32, 0, (cudaStream_t) stream>>>(t, src, (__half*) dst);
     check("iq_dequant_f16");
 }
@@ -1839,14 +1933,15 @@ __global__ void embed_rows_kernel(int ty, const uint8_t* __restrict__ table, siz
 void iq_embed_rows(int t, const void* table, size_t row_bytes, const int32_t* tokens, int64_t n_tok, int64_t n_embd,
                    float* out, void* stream) {
     if (n_tok <= 0) return;
-    if (n_embd % 256 != 0 || !embed_type_supported(t)) { std::fprintf(stderr, "iq_embed_rows: bad arguments\n"); std::exit(1); }
+    // Q6_K (14): GLM-5.3-Flash UD-IQ3_XXS's token_embd, admitted by NativeEmbed::load for glm5-next only
+    if (n_embd % 256 != 0 || !glm_embed_type_supported(t)) { std::fprintf(stderr, "iq_embed_rows: bad arguments\n"); std::exit(1); }
     embed_rows_kernel<<<dim3((unsigned) (n_embd / 256), (unsigned) n_tok), 32, 0, (cudaStream_t) stream>>>(
         t, (const uint8_t*) table, row_bytes, tokens, n_embd, out);
     check("iq_embed_rows");
 }
 
 void iq_dequant_f32(int t, const void* src, int64_t n, float* dst, void* stream) {
-    if (n % 256 != 0 || !embed_type_supported(t)) { std::fprintf(stderr, "iq_dequant_f32: bad arguments\n"); std::exit(1); }
+    if (n % 256 != 0 || !glm_embed_type_supported(t)) { std::fprintf(stderr, "iq_dequant_f32: bad arguments\n"); std::exit(1); }
     dequant_flat_kernel<float><<<(unsigned) (n / 256), 32, 0, (cudaStream_t) stream>>>(t, src, dst);
     check("iq_dequant_f32");
 }
@@ -1862,7 +1957,7 @@ void iq_dequant_gu_f16(int t, const void* gate, const void* up, int64_t n_ff, in
 
 bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) noexcept {
     const int qg = gu_qk(gu_type), qd = d_qk(d_type);
-    return qg > 0 && qd > 0 && is_iq(gu_type) && is_iq(d_type) && n_embd % qg == 0 && n_ff % qd == 0 &&
+    return qg > 0 && qd > 0 && is_iq(gu_type) && is_dq(d_type) && n_embd % qg == 0 && n_ff % qd == 0 &&
            n_embd % 256 == 0 && (n_ff * n_embd) % 256 == 0;
 }
 
@@ -2465,8 +2560,9 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     const int em0 = exp_mode();
 #endif
 #if defined(STRATA_HIP_GFX906)
+    // (the fused kernel's epilogue has no clamp: a clamped layer (GLM-5.3-Flash) takes the separate kernels)
     const bool fused_gu = em0 == 8 && (L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 || L.gu_type == 23) &&
-                          L.n_ff % 32 == 0;
+                          L.n_ff % 32 == 0 && !(L.swiglu_limit > 0.0f);
     if (fused_gu && g_exp_phase != 2) {
         const dim3 gl((unsigned) (L.n_ff / 32), (unsigned) cap_groups);
         const size_t sh = (size_t) LDS_NT * (size_t) (L.n_embd / 32) * sizeof(block_q8_1);
@@ -2531,11 +2627,11 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     const bool sw_v1 = v1;
 #endif
     if (sw_v1) {
-        swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh);
+        swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh, L.swiglu_limit);
         quantize_q8_1_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(h, hq, nh);
     } else {
         swiglu_q8_1_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, grp_start, n_groups,
-                                                                                (int) L.n_ff, hq);
+                                                                                (int) L.n_ff, hq, L.swiglu_limit);
     }
     check("native_expert_grouped/swiglu");
     }
