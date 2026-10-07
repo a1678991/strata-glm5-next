@@ -22,6 +22,7 @@
 // initializer at namespace scope (#391, 016ea2e), the switches are read on first use.
 #include "strata/kernels/cpu/iq_avx2.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/cpu/native_expert_clamp.hpp"
 
 #define GGML_COMMON_DECL_CPP
 #define GGML_COMMON_IMPL_CPP
@@ -466,18 +467,26 @@ int iq256_variant() noexcept {
 
 int iq256_variants() noexcept { return kIq256Gather | (vnni_on() ? kIq256Vnni : 0); }
 
-void iq256_gu_rows_v(int variant, int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n,
-                     const void* const* act, int nt, float* const* ff, int r0, int r1) {
+namespace {
+// limit > 0: GLM-5.3-Flash's clamped SwiGLU (native_expert_clamp.hpp); 0 is the unclamped loop as it was
+void gu_rows_v(int variant, int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n,
+               const void* const* act, int nt, float* const* ff, int r0, int r1, float limit) {
     const bool g = (variant & kIq256Gather) != 0;
 #if STRATA_AVXVNNI
     if (variant & kIq256Vnni) {
-        if (g) vnni::gu_type<true>(type, nt, blob, gu_row, up_off, n, act, ff, r0, r1);
-        else vnni::gu_type<false>(type, nt, blob, gu_row, up_off, n, act, ff, r0, r1);
+        if (g) vnni::gu_type<true>(type, nt, blob, gu_row, up_off, n, act, ff, r0, r1, limit);
+        else vnni::gu_type<false>(type, nt, blob, gu_row, up_off, n, act, ff, r0, r1, limit);
         return;
     }
 #endif
-    if (g) plain::gu_type<true>(type, nt, blob, gu_row, up_off, n, act, ff, r0, r1);
-    else plain::gu_type<false>(type, nt, blob, gu_row, up_off, n, act, ff, r0, r1);
+    if (g) plain::gu_type<true>(type, nt, blob, gu_row, up_off, n, act, ff, r0, r1, limit);
+    else plain::gu_type<false>(type, nt, blob, gu_row, up_off, n, act, ff, r0, r1, limit);
+}
+}  // namespace
+
+void iq256_gu_rows_v(int variant, int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n,
+                     const void* const* act, int nt, float* const* ff, int r0, int r1) {
+    gu_rows_v(variant, type, blob, gu_row, up_off, n, act, nt, ff, r0, r1, 0.0f);
 }
 
 void iq256_rows_v(int variant, int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
@@ -497,6 +506,11 @@ void iq256_rows_v(int variant, int type, const uint8_t* w, size_t row_bytes, int
 void iq256_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, int nt,
                    float* const* ff, int r0, int r1) {
     iq256_gu_rows_v(iq256_variant(), type, blob, gu_row, up_off, n, act, nt, ff, r0, r1);
+}
+
+void iq256_gu_rows_clamp(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, int nt,
+                         float* const* ff, int r0, int r1, float limit) {
+    gu_rows_v(iq256_variant(), type, blob, gu_row, up_off, n, act, nt, ff, r0, r1, limit);
 }
 
 void iq256_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out,
