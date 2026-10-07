@@ -40,7 +40,9 @@
 //
 // The RAM tier's experts are computed by the CPU expert pool (include/strata/core/glm_pool.hpp; --pool-workers,
 // --pool-affinity, --no-host-worker as on the Qwen path; the host thread is pinned to the first physical core while the
-// windows run); STRATA_GLM_POOL=0 copies them into VRAM staging and computes them on the GPU instead (the A/B arm).
+// windows run) or copied into VRAM staging and computed on the GPU: --glm-pool on|off|auto (default auto: a calibration
+// at start times both on the same RAM-tier experts and keeps the faster, GlmExperts::calibrate_pool;
+// STRATA_GLM_POOL_CALIBRATE=N experts, default 256).  STRATA_GLM_POOL=0|1 overrides --glm-pool (the A/B arms).
 #include "strata/program/glm_generate.hpp"
 
 #include "strata/artifact/gguf_reader.hpp"
@@ -194,7 +196,7 @@ int glm_generate(const GlmRunArgs& a) {
     sc::ExpertCache cache;
     sc::GlmExperts experts;
     std::unique_ptr<strata::kernels::cpu::ExpertPool> cpu_pool;
-    sc::GlmPool glm_pool;
+    std::unique_ptr<sc::GlmPool> glm_pool = std::make_unique<sc::GlmPool>();   // reset when --glm-pool auto picks staging
     std::vector<std::pair<int32_t, int32_t>> ranked;
     if (any_moe) {
         src.set_gguf(a.native);
@@ -270,17 +272,44 @@ int glm_generate(const GlmRunArgs& a) {
                          (double) src.resident_bytes() / 1073741824.0,
                          src.complement_pinned() ? "page-locked" : "pageable");
         }
-        const char* pv = std::getenv("STRATA_GLM_POOL");
-        if (src.resident_bytes() > 0 && !(pv != nullptr && std::atoi(pv) == 0)) {
+        // --glm-pool on|off|auto (1 / 0 / -1); STRATA_GLM_POOL=0|1 overrides it
+        int pool_mode = a.glm_pool;
+        if (const char* pv = std::getenv("STRATA_GLM_POOL"); pv != nullptr && *pv) pool_mode = std::atoi(pv) != 0 ? 1 : 0;
+        if (src.resident_bytes() > 0 && pool_mode != 0) {
             cpu_pool = std::make_unique<strata::kernels::cpu::ExpertPool>(a.pool_workers, /*pin=*/true,
                                                                           /*host_works=*/!a.no_host_worker,
                                                                           a.pool_affinity);
-            if (!glm_pool.init(g, cpu_pool.get(), T, (int) g.n_expert_used, err)) return fail(err);
-            experts.set_pool(&glm_pool);
+            if (!glm_pool->init(g, cpu_pool.get(), T, (int) g.n_expert_used, err)) return fail(err);
+            experts.set_pool(glm_pool.get());
             std::fprintf(stderr, "strata generate: glm5-next: RAM-tier experts on the CPU pool, %d threads (%d workers%s)\n",
-                         glm_pool.workers(), cpu_pool->workers(), cpu_pool->host_works() ? " + the host thread" : "");
+                         glm_pool->workers(), cpu_pool->workers(), cpu_pool->host_works() ? " + the host thread" : "");
         }
         if (!experts.init(g, cache.valid() ? &cache : nullptr, &src, T, err)) return fail(err);
+        if (glm_pool->ready() && pool_mode < 0) {
+            // auto: the pool against staging + the GPU on the same RAM-tier experts (glm_experts.hpp
+            // calibrate_pool), the faster kept.  On epyc (23 Zen 4 workers, IQ2_S) the pool read 16.6 GB/s against
+            // 26.9 GB/s over PCIe; on the 7950X with glm-mini it was 3x faster than staging.
+            int n_cal = 256;
+            if (const char* v = std::getenv("STRATA_GLM_POOL_CALIBRATE"); v != nullptr && *v)
+                n_cal = std::max(1, std::atoi(v));
+            sc::GlmExperts::PoolCalibration c;
+            const auto tc = Clock::now();
+            if (!experts.calibrate_pool(n_cal, c, err)) return fail(err);
+            const bool keep = c.ms_pool <= c.ms_gpu;
+            std::fprintf(stderr, "strata generate: glm5-next: --glm-pool auto: %d RAM-tier experts from layer %lld on "
+                                 "(%d calls of %d tokens, %.1f MB): CPU pool %.1f ms (%.1f GB/s), staging + GPU %.1f ms "
+                                 "(%.1f GB/s): %s (calibration %.2f s)\n",
+                         c.experts, (long long) c.layer, c.calls, T, (double) c.bytes / 1e6, c.ms_pool,
+                         (double) c.bytes / 1e6 / std::max(c.ms_pool, 1e-6), c.ms_gpu,
+                         (double) c.bytes / 1e6 / std::max(c.ms_gpu, 1e-6),
+                         keep ? "the CPU pool" : "staging, the pool stopped",
+                         std::chrono::duration<double>(Clock::now() - tc).count());
+            if (!keep) {
+                experts.drop_pool();
+                glm_pool.reset();
+                cpu_pool.reset();
+            }
+        }
     }
 
     // ---- the session
@@ -449,7 +478,7 @@ int glm_generate(const GlmRunArgs& a) {
         strata::kernels::cpu::ThreadAffinity prev;
         ~HostPin() { if (prev.valid) strata::kernels::cpu::restore_thread_affinity(prev); }
     } host_pin;
-    if (glm_pool.ready()) {
+    if (glm_pool && glm_pool->ready()) {
         const std::vector<int> cores = strata::kernels::cpu::physical_cores(false);
         if (!cores.empty()) host_pin.prev = strata::kernels::cpu::pin_current_thread(cores[0]);
     }
