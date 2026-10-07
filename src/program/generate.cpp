@@ -1636,6 +1636,9 @@ int main(int argc, char** argv) {
         glm.prefill_auto = o.prefill_auto;
         glm.prefill_until = o.prefill_until;
         glm.max_new = o.max_new_given ? o.max_new : 0;
+        glm.pool_workers = o.pool_workers;
+        glm.no_host_worker = o.no_host_worker;
+        glm.pool_affinity = o.pool_affinity;
         if (const int rc = glm5_next_preflight(o.native_preset, o.pack, &glm); rc >= 0) return rc;
     }
     strata::core::set_coupled_draft(o.coupled_draft);
