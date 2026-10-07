@@ -25,7 +25,7 @@ struct GlmRunArgs {
     uint64_t resident_headroom = 8ull << 30;
     bool stats = false;                ///< --stats: greedy agreement line
     int64_t prefill_chunk = 0;         ///< --prefill N: the prompt path in chunks of N tokens (0: windows only)
-    bool prefill_auto = false;         ///< --prefill auto: the default chunk (glm_prefill.hpp)
+    bool prefill_auto = false;         ///< --prefill auto: the largest of 8192 / 4096 / 2048 that fits (glm_generate.cpp)
     int64_t prefill_until = 0;         ///< --prefill-until P: the prompt path reads [0, P), windows the rest (0: all
                                        ///< tokens but the last)
     int64_t max_new = 0;               ///< --max-new K: greedy tokens generated after the last one (0: none)
