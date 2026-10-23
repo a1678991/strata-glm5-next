@@ -11,7 +11,7 @@ tqdm==4.70.1
 requests==2.34.2
 cmake==4.4.3
 ninja==1.13.2
-pillow==12.3.0
+pillow==13.0.0
 psutil==7.2.2
 
 # their dependencies
